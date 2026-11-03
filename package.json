@@ -1,0 +1,43 @@
+{
+  "name": "agent-os",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A Lark/Feishu command deck for headless AI coding CLIs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eilyeee/agent-os.git"
+  },
+  "homepage": "https://github.com/eilyeee/agent-os#readme",
+  "packageManager": "pnpm@11.5.3",
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm start",
+    "start": "tsx watch --include .env --include \"config/*.json\" src/index.ts",
+    "start:once": "tsx src/index.ts",
+    "build": "tsc",
+    "check": "pnpm build && node scripts/smoke.mjs",
+    "probe:cli": "tsx src/probe-cli.ts",
+    "probe:tool": "tsx src/probe-app-tool.ts",
+    "integration": "pnpm build && node scripts/integration.mjs",
+    "verify": "pnpm build && node scripts/smoke.mjs && node scripts/integration.mjs",
+    "pm2:start": "pnpm build && pm2 startOrReload ecosystem.config.cjs",
+    "pm2:logs": "pm2 logs agent-os",
+    "pm2:stop": "pm2 stop agent-os",
+    "pm2:save": "pm2 save"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.76.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "dotenv": "^17.4.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3"
+  }
+}

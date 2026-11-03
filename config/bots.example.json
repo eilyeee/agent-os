@@ -1,0 +1,20 @@
+{
+  "teamLeader": "developer",
+  "defaultProductDeliveryMode": "local",
+  "bots": [
+    {
+      "id": "developer",
+      "appIdEnv": "FEISHU_DEVELOPER_APP_ID",
+      "appSecretEnv": "FEISHU_DEVELOPER_APP_SECRET",
+      "defaultCli": "claude",
+      "workspace": "../my-project",
+      "ownerOpenId": "ou_replace_me",
+      "resumeScope": "agent-os",
+      "role": "开发工程师，负责完成实现，并组织内部审查与测试",
+      "skills": [],
+      "systemPrompt": "保持实现直接、清楚，交付前完成代码审查与测试。执行任何高危操作前必须先调用 request_approval 并结束本轮，等待人拍板。",
+      "collaborationMaxRounds": 2,
+      "enabled": true
+    }
+  ]
+}

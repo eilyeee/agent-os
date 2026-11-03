@@ -1,0 +1,4 @@
+allowBuilds:
+  # 仅允许现有构建依赖安装平台二进制与运行时文件，其他依赖脚本仍需显式审核。
+  esbuild: true
+  protobufjs: true

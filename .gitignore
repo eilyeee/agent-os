@@ -1,0 +1,43 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+
+# secrets — never commit
+.env
+.env.*
+!.env.example
+
+# machine-local bot registry (copy from config/bots.example.json)
+config/bots.json
+
+# runtime state: sessions, flows, downloaded attachments
+data/
+
+# private history and planning backups made before the public initial commit
+.local-backups/
+
+# logs
+*.log
+logs/
+
+# skill installer's tool-specific copies — regenerate with `npx skills add`.
+# The canonical copy lives in .agents/skills/ and IS committed.
+.claude/skills/
+agent/skills/
+
+# product artifacts produced by the product manager bot.
+# Scratch by convention — force-add a spec if you want it versioned.
+.scratch/
+
+# internal planning notes, not part of the published repo
+docs/PLAN.md
+
+# machine-local editor and operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo

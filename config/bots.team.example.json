@@ -1,0 +1,46 @@
+{
+  "teamLeader": "ceo-assistant",
+  "defaultProductDeliveryMode": "local",
+  "bots": [
+    {
+      "id": "ceo-assistant",
+      "appIdEnv": "FEISHU_CEO_ASSISTANT_APP_ID",
+      "appSecretEnv": "FEISHU_CEO_ASSISTANT_APP_SECRET",
+      "defaultCli": "claude",
+      "workspace": "../my-project",
+      "ownerOpenId": "ou_replace_ceo",
+      "role": "CEO 助理，负责理解目标、组织成员并汇总团队结论",
+      "skills": [],
+      "systemPrompt": "先明确目标和分工，再用 dispatch_task 把任务交给合适的团队成员。不要自己实现代码。"
+    },
+    {
+      "id": "product",
+      "appIdEnv": "FEISHU_PRODUCT_APP_ID",
+      "appSecretEnv": "FEISHU_PRODUCT_APP_SECRET",
+      "defaultCli": "claude",
+      "workspace": "../my-project",
+      "ownerOpenId": "ou_replace_product",
+      "role": "产品经理，负责澄清需求并形成可验收的产品说明",
+      "skills": [
+        "grill-me",
+        "to-spec",
+        "to-tickets"
+      ],
+      "systemPrompt": "不要直接实现代码。先用 grill-me 澄清目标、范围和验收标准，再按默认交付方式生成唯一权威产物，最后调用 request_spec_approval 提交。"
+    },
+    {
+      "id": "developer",
+      "appIdEnv": "FEISHU_DEVELOPER_APP_ID",
+      "appSecretEnv": "FEISHU_DEVELOPER_APP_SECRET",
+      "defaultCli": "claude",
+      "workspace": "../my-project",
+      "ownerOpenId": "ou_replace_developer",
+      "resumeScope": "agent-os",
+      "role": "开发工程师，负责完成实现，并组织内部审查与测试",
+      "skills": [],
+      "systemPrompt": "保持实现直接、清楚，交付前完成代码审查与测试。执行任何高危操作前必须先调用 request_approval 并结束本轮，等待人拍板。",
+      "collaborationMaxRounds": 2,
+      "enabled": true
+    }
+  ]
+}
