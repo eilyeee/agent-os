@@ -37,7 +37,7 @@ Agent OS 就是这一层。
 ```
 
 **它不调模型 API。** 项目里没有任何 AI SDK 依赖。模型调用、工具执行、上下文管理都留在
-Claude Code 和 Codex 内部，Agent OS 只负责指挥它们 —— 底层引擎以后可以换，
+Claude Code、Codex 和 DeepSeek Harness 内部，Agent OS 只负责指挥它们 —— 底层引擎以后可以换，
 上层建立起来的工作方式会一直留下来。
 
 ### 它不是什么
@@ -54,7 +54,7 @@ Claude Code 和 Codex 内部，Agent OS 只负责指挥它们 —— 底层引�
 
 **单兵作战 —— 随时随地指挥一个 Agent**
 
-- 在飞书话题里提要求，真实的 Claude Code 或 Codex 进程接活
+- 在飞书话题里提要求，真实的 Claude Code、Codex 或 DSH 进程接活
 - 实时任务卡片：当前动作、工具轨迹、耗时、上下文占用、成本
 - 卡片上一键停止任务，且只有发起人点得动
 - 同话题追问续接同一段 CLI 上下文
@@ -85,7 +85,7 @@ Claude Code 和 Codex 内部，Agent OS 只负责指挥它们 —— 底层引�
 |---|---|
 | 运行时 | Node.js 22.13+、pnpm 11.5.3 |
 | 聊天 | 飞书**话题群**（不是普通群），每台 bot 一个自建应用 |
-| 引擎 | [Claude Code](https://docs.claude.com/zh-CN/docs/claude-code) 和/或 [Codex CLI](https://github.com/openai/codex)，已安装并登录 |
+| 引擎 | [Claude Code](https://docs.claude.com/zh-CN/docs/claude-code)、[Codex CLI](https://github.com/openai/codex) 或 [DeepSeek Harness](#deepseek-harness实验性)，已安装并配置凭证 |
 | 系统 | macOS、Linux，或 Windows 下的 Git Bash / WSL2 |
 
 请使用独立的操作系统账号安装、登录所选引擎。模型后端和引擎凭证由各 CLI 的用户级配置管理；
@@ -178,7 +178,7 @@ FEISHU_DEVELOPER_APP_SECRET=xxx
 | `/history` | 本群这台机器人做过的任务（跨话题），可按结局筛选、翻页查看 |
 | `/cost` | 本群这台机器人的开销：累计 tokens、按来源拆分、最贵的几件 |
 | `/team` | 团队名册：职责、引擎、Skill、连接状态 |
-| `/new` | 在本话题开启全新 CLI 会话，旧会话仍可恢复 |
+| `/new` | 在本话题开启全新 CLI 会话 |
 | `/resume` | 从当前工作目录里挑一个历史 CLI 会话恢复 |
 | `/compact [要求]` | 调用引擎原生能力整理当前上下文 |
 | `/cd [目录]` | 查看或切换本话题的工作目录 |
@@ -186,8 +186,24 @@ FEISHU_DEVELOPER_APP_SECRET=xxx
 | `/close` | 停止正在运行的任务并关闭本话题会话 |
 | `/claude <任务>` | 新话题使用 Claude Code |
 | `/codex <任务>` | 新话题使用 Codex |
+| `/dsh <任务>` | 新话题使用 DeepSeek Harness |
 
-**执行引擎在话题创建时定死**，想切换就新开话题 —— 两种 CLI 的 session id 并不互通。
+**执行引擎在话题创建时定死**，想切换就新开话题 —— 各 CLI 的 session id 并不互通。
+
+### DeepSeek Harness（实验性）
+
+适配官方 `@deepseek-ai/dsh@0.2.1-rc.5`，建议用 Node.js 24.9+ 运行 DSH，并确保 Agent OS 的 `PATH` 能找到该版本的 `dsh`。旧版 DSH 不支持本适配器所需的 JSON 事件与原生会话续接。
+
+```bash
+npm install -g @deepseek-ai/dsh@0.2.1-rc.5
+dsh --profile headless --help
+```
+
+先按[官方 headless 文档](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/bundle/headless/README.zh.md)配置 DSH 的模型与凭证；凭证留在 DSH 用户目录（默认 `~/.dsh/.env`，也可指定 `$DSH_HOME/.env`），不要写进 Agent OS 的 `.env` 或 bot JSON。然后在新话题发送 `/dsh 任务`，或将 `defaultCli` 设为 `"dsh"`。
+
+支持任务执行、同话题自动续接、工具进度、用量统计，以及澄清、审批、派活、定时任务等五个 MCP 应用工具。Agent OS 自动生成临时 MCP patch 和原生事件桥接，不改写 DSH 用户配置，也不新增模型 API 依赖。五个应用工具全部注册后才启动任务；MCP 或桥接加载失败会阻止执行。子 Agent 与 PTC 内的应用工具请求也通过桥接送回主话题，用户回答后续跑主会话。同一次 CLI 执行只受理一个成功的应用请求；并行的后续请求会明确返回错误，等待当前请求处理后再提交。DSH 使用 `workspace-write` 与非交互拒绝策略：需要引擎提权的操作会被拒绝，飞书审批通过也不会绕过其沙箱。
+
+当前 headless 没有历史列表或原生命令路由，`/resume` 列表与手动 `/compact` 暂不可用；原话题继续自动续接，压缩由 DSH 原生自动处理，`/new` 可开启新上下文。应用工具使用原生最终结果中的完整参数，不从被截断的 JSONL 通知派发；首轮失败或取消后仍保存原生会话绑定，可在原话题继续。历史的验证标记只认已创建子任务的原生 preset 身份（`tester` / `code-reviewer`），不从自由描述猜角色。模型配置完成后，可在受信任的测试目录运行 `pnpm probe:tool dsh /absolute/workspace` 验证 MCP 链路。
 
 ---
 
@@ -198,11 +214,11 @@ src/im/     接入层    长连接、事件解析、卡片构建
 src/core/   内核层    会话、状态机、持久化、协作
 src/cli/    引擎层    每种 CLI 的参数与协议 → 统一 CliEvent
 src/app/    编排层    一条消息在系统里怎么流动
-src/mcp/    工具层    本地 MCP Server，向两种 CLI 暴露同一套应用工具
+src/mcp/    工具层    本地 MCP Server，向各 CLI 暴露同一套应用工具
 ```
 
 **内核不依赖任何消息平台。** 引擎差异被压缩进三个 adapter 方法 ——
-`buildArgs`、`buildResumeArgs`、`parseEvents` —— 所以接入第三种 CLI 是加一个文件，
+`buildArgs`、`buildResumeArgs`、`parseEvents` —— 所以接入新 CLI 是扩展适配器，
 而不是复制第二条流水线。
 
 分层规则、工程约定和值得提前知道的坑，见 [`AGENTS.md`](./AGENTS.md)（英文，供 AI Agent 读取）。

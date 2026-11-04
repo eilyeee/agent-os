@@ -1,11 +1,13 @@
 /** 执行引擎注册表。入口层只拿 CliAdapter，不直接 new 具体实现。 */
 import { ClaudeAdapter } from "./claude-adapter.js";
 import { CodexAdapter } from "./codex-adapter.js";
+import { DshAdapter } from "./dsh-adapter.js";
 import type { CliAdapter, CliId } from "./types.js";
 
 const adapters: Record<CliId, CliAdapter> = {
   claude: new ClaudeAdapter(),
   codex: new CodexAdapter(),
+  dsh: new DshAdapter(),
 };
 
 export function getCliAdapter(id: CliId): CliAdapter {
@@ -18,6 +20,6 @@ export function listCliAdapters(): CliAdapter[] {
 
 export function parseCliId(value: string | undefined): CliId {
   if (!value) return "claude";
-  if (value === "claude" || value === "codex") return value;
-  throw new Error(`不支持的执行引擎: ${value}，请填写 claude 或 codex`);
+  if (value === "claude" || value === "codex" || value === "dsh") return value;
+  throw new Error(`不支持的执行引擎: ${value}，请填写 claude、codex 或 dsh`);
 }

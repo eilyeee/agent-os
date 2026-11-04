@@ -81,7 +81,7 @@ const BotSchema = z.object({
   // 配置里只写环境变量名，真实凭证留在 .env。
   appIdEnv: z.string().regex(/^[A-Z_][A-Z0-9_]*$/),
   appSecretEnv: z.string().regex(/^[A-Z_][A-Z0-9_]*$/),
-  defaultCli: z.enum(["claude", "codex"]),
+  defaultCli: z.enum(["claude", "codex", "dsh"]),
   role: z.string().trim().min(1),
   skills: z
     .array(z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/))

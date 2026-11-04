@@ -2627,4 +2627,457 @@ await t("[超时] 空闲超时与总时长超时都带具名标记，上层不�
   }
 });
 
+
+console.log("DeepSeek Harness");
+const dsh = getCliAdapter("dsh");
+const dshLine = (event) => dsh.parseEvents(JSON.stringify(event));
+const dshBridge = (kind, fields = {}) => ({ type: "agent_os.bridge", version: 1, kind, ...(kind === "app_tool" ? { executionId: "1" } : {}), ...fields });
+const dshApp = (tool, input, fields = {}) => dshBridge("app_tool", {
+  rootSessionId: "session-root", sessionId: "session-root", callId: "call", tool: `mcp__agent_os__${tool}`, input, failed: false, ...fields,
+});
+await t("DSH 配置、注册表与斜杠入口接受同一引擎标识", async () => {
+  const { parseCliId, listCliAdapters } = await R("cli/registry.js");
+  assert.equal(parseCliId("dsh"), "dsh");
+  assert.ok(listCliAdapters().includes(dsh));
+  assert.equal(parseAgentOsConfig({ teamLeader: "dev", bots: [{ ...baseBot, defaultCli: "dsh" }] }, env).bots[0].defaultCliId, "dsh");
+  assert.deepEqual(CP.parseCliRequest("@开发助手 / dsh 检查项目\n第二行"), { cliId: "dsh", prompt: "检查项目\n第二行" });
+  assert.ok(CP.KNOWN_COMMANDS.includes("dsh"));
+});
+await t("DSH 参数走 stdin，续接保持原生 ID，MCP patch 挂载五个应用工具", async () => {
+  const prompt = '中文 "空格"\n$(touch forbidden)';
+  const args = dsh.buildArgs(prompt, "stdin");
+  assert.deepEqual(args.slice(0, 2), ["--profile", "headless"]);
+  assert.deepEqual(args.slice(-3), ["--json", "--", "-"]);
+  assert.ok(!args.includes(prompt));
+  const resume = dsh.buildResumeArgs(prompt, "session-test", "stdin");
+  assert.equal(resume[resume.indexOf("--session-id") + 1], "session-test");
+  assert.deepEqual(resume.slice(-2), ["--", "-"]);
+  const patch = JSON.parse(readFileSync(args[args.indexOf("--patch") + 1], "utf8"));
+  assert.equal(patch.find((r) => r.id === "sandbox-policy").config.mode, "workspace-write");
+  assert.equal(patch.find((r) => r.id === "approval").config.policy, "never");
+  assert.deepEqual(patch.find((r) => r.id === "permission").config, { defaultPreset: "agent-os", presets: { "agent-os": { sandbox: "workspace-write", approval: "never" } } });
+  const mcp = patch.flatMap((r) => r.insert ?? []).find((r) => r.id === "agent-os-mcp");
+  assert.equal(mcp.name, "@deepseek-ai/dsh-mcp-client");
+  assert.equal(mcp.config.serverName, "agent_os");
+  assert.equal(mcp.config.command, process.execPath);
+  assert.ok(mcp.config.args.at(-1).replaceAll("\\", "/").endsWith("mcp/app-tools-server.js"));
+  assert.equal(mcp.config.failOnStartupError, true);
+  assert.deepEqual(patch.find(r => r.id === "headless-runner").inject, ["headlessStartup", "agentOsBridge"]);
+  assert.deepEqual(patch.find(r => r.id === "agent-loop").config.agents, []);
+  const bridge = patch.flatMap(r => r.insert ?? []).find(r => r.id === "agent-os-bridge");
+  assert.ok(bridge.name.endsWith(".mjs"));
+  assert.ok(readFileSync(bridge.name, "utf8").includes('ctx.provide("agentOsBridge"'));
+});
+await t("DSH 只用无损 final 结算，不把中途文本或思考当答案", () => {
+  assert.deepEqual(dshLine({ type: "session", sessionId: "session-a" }), [{ type: "session", sessionId: "session-a" }]);
+  for (const type of ["text", "thinking"]) assert.deepEqual(dshLine({ type, text: "还没完成" }), []);
+  const answer = "完整答案".repeat(4000); // 超过上游 8 KiB 限制，终态必须无损。
+  assert.deepEqual(dshLine({ type: "final", text: answer }), [{ type: "result", answer, final: true }]);
+  assert.equal(dshLine({ type: "final", text: "", reason: { kind: "completed" } })[0].final, true);
+  assert.equal(dshLine({ type: "final", text: "未完成", reason: { kind: "aborted" } })[0].type, "error");
+  assert.equal(dshLine({ type: "final", text: "未知状态", reason: null })[0].type, "error");
+  assert.equal(dshLine({ type: "status", phase: "turn_end", reason: { kind: "error", message: "执行失败" } })[0].message, "执行失败");
+  for (const raw of ['noise', 'null', '[]', '{"type":"final","text":8}', '{"type":"session","sessionId":false}']) assert.deepEqual(dsh.parseEvents(raw), []);
+});
+await t("DSH 五个 MCP 工具精确还原命名空间，普通工具不触发应用动作", async () => {
+  const { APP_TOOL_NAMES } = await R("cli/app-tools.js");
+  assert.equal(APP_TOOL_NAMES.size, 5);
+  for (const name of APP_TOOL_NAMES) {
+    const input = { title: "审批原文", nested: { note: "内容" } };
+    assert.deepEqual(dshLine({ type: "tool_call", callId: `call-${name}`, tool: `mcp__agent_os__${name}`, input }), []);
+    const events = dshLine(dshApp(name, input, { callId: `call-${name}` }));
+    assert.equal(events[0].type, "tool_start");
+    assert.deepEqual(events.find((e) => e.type === "tool_call"), { type: "tool_call", toolUseId: `bridge:${JSON.stringify(["session-root", `call-${name}`, "1"])}`, toolName: name, input, completed: true });
+  }
+  for (const tool of ["read_file", "mcp__another__request_approval", "__proto__", "constructor"]) {
+    const events = dshLine({ type: "tool_call", callId: "a", tool, input: {} });
+    assert.ok(!events.some((e) => e.type === "tool_call"));
+    assert.equal(typeof events[0].label, "string");
+  }
+  assert.equal(dshLine({ type: "tool_call", callId: "sub", tool: "subagent", input: { agent_preset: "tester" } })[0].subagentType, undefined, "请求过不能冒充已经创建验证子任务");
+  assert.deepEqual(dshLine({ type: "tool_result", callId: "a", status: "error", truncated: true }), [{ type: "tool_end", toolUseId: "native:a", failed: true }]);
+});
+await t("DSH 截断请求一律拒绝，包括只剩 type 的超长事件", () => {
+  for (const event of [
+    { type: "tool_call", callId: "a", tool: "write", input: { content: "被截断" } },
+    { type: "tool_call" }, { type: "session", sessionId: "session-truncated" },
+    { type: "final", text: "不完整" },
+  ]) {
+    const events = dshLine({ ...event, truncated: true });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "error");
+    assert.match(events[0].message, /截断/);
+  }
+});
+
+const dshProcess = (events, code = 0, ready = true) => ({
+  id: "dsh", displayName: "DeepSeek Harness", capabilities: dsh.capabilities,
+  command: process.execPath,
+  buildArgs: () => ["-e", `process.stdin.resume(); process.stdin.on('end', () => { for (const e of JSON.parse(process.argv[1])) console.log(JSON.stringify(e)); process.exitCode = Number(process.argv[2]); });`, JSON.stringify([...(ready ? [dshBridge("ready")] : []), ...events]), String(code)],
+  buildResumeArgs() { return this.buildArgs(); },
+  buildCompactPlan: () => dsh.buildCompactPlan(),
+  parseEvents: (line) => dsh.parseEvents(line),
+});
+await t("DSH Runner 按执行累计多步用量，并发话题互不串用", async () => {
+  const { runCli } = await R("cli/runner.js");
+  const run = (n) => runCli({ adapter: dshProcess([
+    { type: "session", sessionId: `session-${n}` },
+    { type: "status", phase: "step_end", usage: { inputTokens: n, outputTokens: 2, totalTokens: n + 2, cacheReadTokens: 3, cacheWriteTokens: 4 } },
+    { type: "status", phase: "step_end", usage: { inputTokens: n * 2, outputTokens: 5, totalTokens: n * 2 + 5, cacheReadTokens: 6, cacheWriteTokens: 8 } },
+    { type: "status", phase: "turn_end", reason: { kind: "completed" } },
+    { type: "final", text: `答案${n}` },
+  ]), prompt: "机密中文\n$()", cwd: process.cwd() });
+  const results = await Promise.all([run(10), run(100)]);
+  for (const [i, n] of [10, 100].entries()) {
+    assert.equal(results[i].sessionId, `session-${n}`);
+    assert.equal(results[i].answer, `答案${n}`);
+    assert.deepEqual(results[i].stats, { inputTokens: n * 3, outputTokens: 7, totalTokens: n * 3 + 7, cacheReadTokens: 9, cacheCreationTokens: 12, turns: 1 });
+  }
+});
+await t("DSH 缺失一步用量时不把部分和展示成整轮消耗", async () => {
+  const { runCli } = await R("cli/runner.js");
+  for (const missing of [undefined, { inputTokens: 10, outputTokens: 2 }, { inputTokens: -1, outputTokens: 2 }]) {
+    const result = await runCli({ adapter: dshProcess([
+      { type: "status", phase: "step_end", usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 } },
+      { type: "status", phase: "step_end", ...(missing ? { usage: missing } : { truncated: true }) },
+      { type: "status", phase: "step_end", usage: { inputTokens: 200, outputTokens: 30, totalTokens: 230 } },
+      { type: "status", phase: "turn_end", reason: { kind: "completed" } },
+      { type: "final", text: "完成" },
+    ]), prompt: "测试", cwd: process.cwd() });
+    assert.equal(result.stats.totalTokens, undefined, "部分步骤的 token 被报成了整轮总量");
+    assert.equal(result.stats.turns, 1);
+    assert.equal(result.stats.inputTokens, missing?.inputTokens > 0 ? 310 : undefined);
+  }
+});
+await t("DSH Runner 拒绝缺失 final、失败终态、非零退出和截断派活", async () => {
+  const { runCli } = await R("cli/runner.js");
+  for (const [events, code, pattern] of [
+    [[{ type: "text", text: "中途文本" }], 0, /没有返回最终结果/],
+    [[{ type: "status", phase: "turn_end", reason: { kind: "aborted" } }, { type: "final", text: "假的成功" }], 0, /未完成/],
+    [[{ type: "final", text: "假的成功" }], 1, /状态码 1/],
+    [[{ type: "tool_call", truncated: true }, { type: "final", text: "假的成功" }], 0, /截断/],
+  ]) {
+    await assert.rejects(() => runCli({ adapter: dshProcess(events, code), prompt: "测试", cwd: process.cwd() }), pattern);
+  }
+});
+await t("DSH 工具轮允许空终态，失败的 MCP 结果不会交给编排层", async () => {
+  const { runCli } = await R("cli/runner.js");
+  const result = await runCli({ adapter: dshProcess([
+    dshApp("dispatch_task", { task: "不应派发" }, { callId: "bad", failed: true }),
+    { type: "tool_result", callId: "bad", status: "error", truncated: true },
+    dshApp("request_approval", { title: "保留" }, { callId: "good" }),
+    { type: "tool_result", callId: "good", status: "completed" },
+    { type: "final", text: "" },
+  ]), prompt: "测试", cwd: process.cwd() });
+  assert.equal(result.answer, "");
+  assert.deepEqual(result.toolCalls.map((c) => c.toolUseId), ['bridge:["session-root","good","1"]']);
+});
+await t("DSH 会话持久化向后兼容，三种引擎重启后保留原标识", async () => {
+  const file = join(dir, "dsh-sessions.json");
+  const rows = ["claude", "codex", "dsh"].map((cliId) => ({
+    id: cliId, botId: "dev", chatId: "c", threadId: `thread-${cliId}`, cliId,
+    cliSessionId: `native-${cliId}`, workspaceDir: "/tmp", status: "idle",
+    createdAt: "2026-08-21T01:00:00.000Z", updatedAt: "2026-08-21T01:00:00.000Z",
+  }));
+  // 同时带一条缺字段的旧记录，确保扩展引擎时原有迁移路径仍然工作。
+  const { botId, workspaceDir, ...legacy } = rows[0];
+  writeFileSync(file, JSON.stringify([legacy, ...rows.slice(1)]));
+  const store = new JsonSessionStore(file, "dev", { dev: "/tmp" });
+  assert.deepEqual((await store.load()).map((r) => [r.cliId, r.cliSessionId]), rows.map((r) => [r.cliId, r.cliSessionId]));
+  assert.deepEqual((await new JsonSessionStore(file).load()).map((r) => r.cliId), ["claude", "codex", "dsh"]);
+});
+await t("DSH 历史记录与既有引擎混合落盘后全部可读", async () => {
+  const file = join(dir, "dsh-tasks.json");
+  const store = await TR.JsonTaskRecordStore.open(file);
+  for (const cliId of ["claude", "codex", "dsh"]) await store.append(taskInput({ cliId }));
+  const restarted = await TR.JsonTaskRecordStore.open(file);
+  assert.deepEqual(restarted.list().map((r) => r.cliId), ["claude", "codex", "dsh"]);
+});
+await t("DSH 未支持的原生入口明确拒绝，不会误启 Codex 协议", async () => {
+  const { listNativeCliSessions } = await R("cli/native-sessions.js");
+  const { compactCliSession } = await R("cli/native-compact.js");
+  const adapter = Object.assign(Object.create(dsh), { command: "/does-not-exist" });
+  await assert.rejects(() => listNativeCliSessions({ adapter, cwd: process.cwd() }), /原话题会自动续接/);
+  await assert.rejects(() => compactCliSession({ adapter, cwd: process.cwd(), sessionId: "session-test" }), /原生自动压缩/);
+});
+
+
+await t("DSH 原生 MCP 截断通知只作旁路，无损桥接才提交原文且不重复派发", async () => {
+  const { runCli } = await R("cli/runner.js");
+  const input = { toBotId: "developer", task: "任务".repeat(2000) }; // 单字符串 12 KiB，跨过 8 KiB 截断线。
+  const result = await runCli({ adapter: dshProcess([
+    { type: "session", sessionId: "session-root" },
+    { type: "tool_call", callId: "big", tool: "mcp__agent_os__dispatch_task", input: { ...input, task: "被截断" }, truncated: true },
+    dshApp("dispatch_task", input, { callId: "big" }),
+    { type: "tool_result", callId: "big", status: "completed" },
+    { type: "final", text: "等待队友" },
+  ]), prompt: "测试", cwd: process.cwd() });
+  assert.equal(result.toolCalls.length, 1);
+  assert.deepEqual(result.toolCalls[0].input, input);
+});
+await t("DSH 子任务和 PTC 的相同 callId 按原生会话隔离", async () => {
+  const { runCli } = await R("cli/runner.js");
+  const result = await runCli({ adapter: dshProcess([
+    { type: "session", sessionId: "session-root" },
+    dshApp("request_clarification", { title: "子任务一" }, { sessionId: "child-one", callId: "same" }),
+    dshApp("request_approval", { title: "子任务二" }, { sessionId: "child-two", callId: "same", failed: true }),
+    dshApp("schedule_manage", { action: "create" }, { callId: "run:ptc:1", failed: true }),
+    { type: "final", text: "等待确认" },
+  ]), prompt: "测试", cwd: process.cwd() });
+  assert.deepEqual(result.toolCalls.map((c) => [c.toolUseId, c.toolName]), [
+    ['bridge:["child-one","same","1"]', "request_clarification"],
+  ]);
+});
+await t("DSH 缺失就绪握手与不兼容桥接不能被原生 completed 掩盖", async () => {
+  const { runCli } = await R("cli/runner.js");
+  await assert.rejects(() => runCli({ adapter: dshProcess([{ type: "final", text: "虚假的成功" }], 0, false), prompt: "测试", cwd: process.cwd() }), /应用工具未就绪/);
+  for (const event of [dshBridge("ready", { version: 2 }), dshBridge("app_tool", { tool: "mcp__agent_os__dispatch_task" }), dshApp("request_clarification", { title: "缺执行标识" }, { executionId: undefined })]) {
+    await assert.rejects(() => runCli({ adapter: dshProcess([event, { type: "final", text: "虚假的成功" }]), prompt: "测试", cwd: process.cwd() }), /桥接协议不兼容/);
+  }
+});
+await t("DSH 不同文件不报重复，相同参数仍能识别原地打转", async () => {
+  const { runCli } = await R("cli/runner.js");
+  const run = (paths) => runCli({ adapter: dshProcess([
+    ...paths.flatMap((file_path, i) => [
+      { type: "tool_call", callId: `read-${i}`, tool: "read", input: { file_path } },
+      { type: "tool_result", callId: `read-${i}`, status: "completed" },
+    ]), { type: "final", text: "检查完成" },
+  ]), prompt: "测试", cwd: process.cwd() });
+  const longPrefix = "/workspace/" + "相同前缀/".repeat(60);
+  const different = await run(Array.from({ length: 7 }, (_, i) => `${longPrefix}file-${i}.ts`));
+  assert.equal(different.stats?.spinningOn, undefined, "超过展示长度的不同路径不能混成同一个调用");
+  const repeated = await run(Array(7).fill("/workspace/same.ts"));
+  assert.match(repeated.stats.spinningOn, /read.*same.ts/);
+  assert.equal(dshLine({ type: "tool_call", callId: "detail", tool: "read", input: { file_path: "/workspace/example.ts" } })[0].detail, "/workspace/example.ts");
+});
+await t("DSH 验证证据来自已创建子任务的原生 preset，普通描述不能冒充", async () => {
+  const { runCli } = await R("cli/runner.js");
+  const result = await runCli({ adapter: dshProcess([
+    { type: "tool_call", callId: "attempt", tool: "subagent", input: { agent_preset: "tester", description: "tester code-reviewer" } },
+    { type: "tool_result", callId: "attempt", status: "error" },
+    dshBridge("subagent", { rootSessionId: "session-root", sessionId: "child-test", role: "tester" }),
+    dshBridge("subagent", { rootSessionId: "session-root", sessionId: "child-review", role: "code-reviewer" }),
+    { type: "final", text: "验证完成" },
+  ]), prompt: "测试", cwd: process.cwd() });
+  assert.deepEqual(result.stats.subagents, ["tester", "code-reviewer"]);
+  assert.equal(TR.isUnverifiedRun({ editedFiles: true, subagents: result.stats.subagents }, true), false);
+  const attempted = await runCli({ adapter: dshProcess([
+    { type: "tool_call", callId: "attempt", tool: "subagent", input: { agent_preset: "tester", description: "tester" } },
+    { type: "tool_result", callId: "attempt", status: "error" }, { type: "final", text: "没能创建" },
+  ]), prompt: "测试", cwd: process.cwd() });
+  assert.equal(TR.isUnverifiedRun({ editedFiles: true, subagents: attempted.stats?.subagents }, true), true);
+});
+await t("Runner 失败前等待原生会话绑定落盘，绑定写失败会终止任务", async () => {
+  const { runCli } = await R("cli/runner.js");
+  const saved = [];
+  await assert.rejects(() => runCli({ adapter: dshProcess([
+    { type: "session", sessionId: "native-failed" }, { type: "error", message: "非瞬时失败" },
+  ]), prompt: "测试", cwd: process.cwd(), onSession: async (id) => { await new Promise(r => setTimeout(r, 30)); saved.push(id); } }), /非瞬时失败/);
+  assert.deepEqual(saved, ["native-failed"], "抛错并释放会话前必须等绑定保存完成");
+  await assert.rejects(() => runCli({ adapter: dshProcess([
+    { type: "session", sessionId: "native-nosave" }, { type: "final", text: "不该成功" },
+  ]), prompt: "测试", cwd: process.cwd(), onSession: async () => { throw new Error("绑定写盘失败"); } }), /绑定写盘失败/);
+});
+
+// 使用生成出来的真实插件源码验证事件与对象身份，避免用另一个实现自证。
+const { dshRuntimeBridgeSource } = await R("cli/dsh-runtime-bridge.js");
+const { DSH_APP_TOOL_NAMES } = await R("cli/app-tools.js");
+const bridgePlugin = await import(`data:text/javascript;base64,${Buffer.from(dshRuntimeBridgeSource(Object.keys(DSH_APP_TOOL_NAMES))).toString("base64")}`);
+function bridgeFixture(catalog = Object.keys(DSH_APP_TOOL_NAMES)) {
+  const listeners = new Map(), services = new Map(), agents = new Map(), parents = new Map(), guards = [], output = [];
+  let names = catalog;
+  const ctx = {
+    on(name, fn) { const list = listeners.get(name) ?? []; list.push(fn); listeners.set(name, list); return () => {}; },
+    provide(name, value) { services.set(name, value); return () => services.delete(name); },
+    tools: { schemas: () => names.map(name => ({ name })), guard: fn => guards.push(fn) },
+    agents: { get: id => agents.get(id), isOwnedBy: (id, parent) => parents.get(id) === parent },
+  };
+  const fire = (name, ...args) => { for (const fn of listeners.get(name) ?? []) fn(...args); };
+  const capture = fn => {
+    const original = process.stdout.write;
+    process.stdout.write = value => { output.push(JSON.parse(value)); return true; };
+    try { return fn(); } finally { process.stdout.write = original; }
+  };
+  capture(() => bridgePlugin.apply(ctx));
+  const create = (id, parent, preset) => {
+    const agent = { id, session: { id, header: parent ? { origin: "subagent", delegationDepth: 1, ...(preset ? { agentPreset: preset } : {}) } : {} } };
+    agents.set(id, agent); if (parent) parents.set(id, parent);
+    capture(() => fire("agent/created", { agent })); return agent;
+  };
+  return { ctx, fire, capture, create, agents, guards, services, output, catalog: value => { names = value; capture(() => fire("tools/change")); } };
+}
+await t("DSH 原生启动门只在五个工具全部注册后开放，卸载不误报失败", () => {
+  const f = bridgeFixture([]);
+  assert.equal(f.services.has("agentOsBridge"), false);
+  const names = Object.keys(DSH_APP_TOOL_NAMES);
+  f.catalog(names.slice(0, 4)); assert.equal(f.services.has("agentOsBridge"), false);
+  f.catalog(names); assert.equal(f.services.has("agentOsBridge"), true);
+  assert.equal(f.output.filter(e => e.kind === "ready").length, 1);
+  const root = f.create("root");
+  f.catalog([]);
+  assert.ok(!f.output.some(e => e.kind === "error"), "正常卸载不应把完成结果改写成失败");
+  let calls = 0;
+  assert.throws(() => f.fire("llm/stream", { sessionId: root.id }, () => { calls++; }), /应用工具未就绪/);
+  assert.equal(calls, 0, "应用工具丢失后不能继续调用模型");
+});
+await t("DSH 原生桥接覆盖后代和 PTC，并拒绝跨任务与复用标识冒充", () => {
+  const f = bridgeFixture();
+  const root = f.create("root"); const child = f.create("child", root, "tester"); const grandchild = f.create("grandchild", child, "code-reviewer");
+  const foreign = f.create("foreign");
+  for (const agent of [root, child, grandchild]) {
+    const exec = { agent, name: "mcp__agent_os__request_clarification", callId: "same", arguments: { title: agent.id }, token: Symbol(agent.id) };
+    assert.equal(f.guards[0](exec), undefined);
+    f.capture(() => f.fire("tools/result", exec, { isError: true }));
+  }
+  const ptc = { agent: child, name: "mcp__agent_os__request_approval", callId: "run:ptc:1", arguments: { title: "PTC" }, parent: {}, token: Symbol("ptc") };
+  assert.equal(f.guards[0](ptc), undefined);
+  f.capture(() => f.fire("tools/result", ptc, { isError: false }));
+  const evil = { ...ptc, agent: foreign };
+  assert.match(f.guards[0](evil), /只能由本次主任务/);
+  f.capture(() => f.fire("tools/result", evil, { isError: false }));
+  f.capture(() => f.fire("agent/disposed", { agent: child }));
+  f.agents.set("child", { ...child });
+  assert.match(f.guards[0](ptc), /只能由本次主任务/);
+  f.capture(() => f.fire("tools/result", ptc, { isError: false }));
+  const calls = f.output.filter(e => e.kind === "app_tool");
+  assert.equal(calls.length, 4);
+  assert.deepEqual(calls.map(e => e.sessionId), ["root", "child", "grandchild", "child"]);
+  assert.ok(calls.every(e => e.rootSessionId === "root"));
+  assert.deepEqual(f.output.filter(e => e.kind === "subagent").map(e => e.role), ["tester", "code-reviewer"]);
+});
+await t("DSH 桥接结果保留原文与失败标记，畸形协议不能静默丢单", () => {
+  const f = bridgeFixture(); const agent = f.create("root");
+  const input = { task: "全文".repeat(6000) };
+  const exec = { agent, name: "mcp__agent_os__dispatch_task", callId: "full", arguments: input, token: Symbol("full") };
+  assert.equal(f.guards[0](exec), undefined);
+  f.capture(() => f.fire("tools/result", exec, { isError: false }));
+  f.capture(() => f.fire("tools/result", { ...exec, callId: "failed", token: Symbol("denied") }, { isError: true }));
+  f.capture(() => f.fire("tools/result", exec, { isError: "false" }));
+  const calls = f.output.filter(e => e.kind === "app_tool");
+  assert.equal(calls[0].input.task, input.task);
+  assert.equal(calls[1].failed, true);
+  assert.equal(f.output.at(-1).kind, "error");
+});
+
+
+await t("Runner 在 CLI 退出但绑定仍保存时收到取消，不能结算成功", async () => {
+  const { runCli } = await R("cli/runner.js");
+  let release, started;
+  const saving = new Promise(resolve => { started = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const controller = new AbortController();
+  const running = runCli({ adapter: dshProcess([
+    { type: "session", sessionId: "native-delayed" }, { type: "final", text: "仍可取消" },
+  ]), prompt: "测试", cwd: process.cwd(), signal: controller.signal, onSession: async () => { started(); await gate; } });
+  const outcome = running.then(value => ({ value }), error => ({ error }));
+  await saving;
+  // 毫秒：让短命 CLI 退出，取消特意落在磁盘绑定尚未完成的窗口。
+  await new Promise(resolve => setTimeout(resolve, 150));
+  controller.abort(); release();
+  const result = await outcome;
+  assert.ok(result.error, "保存绑定时的停止被忽略，错误返回了成功结果");
+  assert.match(result.error.message, /已取消/);
+});
+
+await t("DSH 并行应用请求只受理一项，拒绝回执不能释放或清掉已有请求", async () => {
+  const f = bridgeFixture(); const agent = f.create("root"); const child = f.create("child", agent);
+  const first = { agent, name: "mcp__agent_os__request_clarification", callId: "same", arguments: { title: "第一项" }, token: Symbol("first") };
+  const second = { ...first, agent: child, arguments: { title: "第二项" }, token: Symbol("second") };
+  assert.equal(f.guards[0](first), undefined);
+  assert.match(f.guards[0](second), /本轮已有应用请求/);
+  f.capture(() => f.fire("tools/result", second, { isError: true }));
+  assert.match(f.guards[0]({ ...second, token: Symbol("third") }), /本轮已有应用请求/, "被拒的第二项不能释放第一项的占位");
+  f.capture(() => f.fire("tools/result", first, { isError: false }));
+  const repeated = { ...first, token: Symbol("reused-call-id") };
+  assert.match(f.guards[0](repeated), /本轮已有应用请求/);
+  f.capture(() => f.fire("tools/result", repeated, { isError: true }));
+  const { runCli } = await R("cli/runner.js");
+  const result = await runCli({ adapter: dshProcess([...f.output, { type: "final", text: "等待第一项" }]), prompt: "测试", cwd: process.cwd() });
+  assert.equal(result.toolCalls.length, 1, "后续被拒、但复用 callId 的调用抹掉了第一项");
+  assert.equal(result.toolCalls[0].input.title, "第一项");
+  const calls = f.output.filter(e => e.kind === "app_tool");
+  assert.notEqual(calls[1].executionId, calls[2].executionId);
+  assert.ok(!calls.some(e => e.input.title === "第二项" && !e.failed));
+});
+await t("DSH 应用请求失败才释放提交门，未知执行 token 不能提交", () => {
+  const f = bridgeFixture(); const agent = f.create("root");
+  const first = { agent, name: "mcp__agent_os__dispatch_task", callId: "same", arguments: { task: "首次失败" }, token: Symbol("first") };
+  for (const token of [undefined, {}, "fake"]) assert.match(f.guards[0]({ ...first, token }), /只能由本次主任务/);
+  assert.equal(f.guards[0](first), undefined);
+  f.capture(() => f.fire("tools/result", first, { isError: true }));
+  const retry = { ...first, arguments: { task: "合法重试" }, token: Symbol("retry") };
+  assert.equal(f.guards[0](retry), undefined);
+  f.capture(() => f.fire("tools/result", retry, { isError: false }));
+  for (const token of [undefined, {}, "fake"]) assert.match(f.guards[0]({ ...retry, token }), /只能由本次主任务/);
+  const calls = f.output.filter(e => e.kind === "app_tool");
+  assert.deepEqual(calls.map(e => e.failed), [true, false]);
+  assert.notEqual(calls[0].executionId, calls[1].executionId);
+});
+await t("Runner 防御异常桥接的多个成功请求，不让编排静默选择最后一项", async () => {
+  const { runCli } = await R("cli/runner.js");
+  await assert.rejects(() => runCli({ adapter: dshProcess([
+    dshApp("request_clarification", { title: "第一项" }, { callId: "first" }),
+    dshApp("request_clarification", { title: "第二项" }, { callId: "second", executionId: "2" }),
+    { type: "final", text: "不该只显示最后一项" },
+  ]), prompt: "测试", cwd: process.cwd() }), /多个成功的应用工具请求/);
+});
+
+async function withFastCliRetry(fn) {
+  const original = globalThis.setTimeout;
+  // 毫秒：本组只验证跨重试数据，不重复等待生产的 20 秒退避。
+  globalThis.setTimeout = (fn, ms, ...args) => original(fn, ms === 20_000 ? 0 : ms, ...args);
+  try { return await fn(); } finally { globalThis.setTimeout = original; }
+}
+await t("已确认应用请求跨瞬时重试保留，提前通知不能冒充已提交", async () => {
+  const { runCli } = await R("cli/runner.js");
+  for (const completed of [true, false]) {
+    const flag = join(dir, `retry-app-${completed}.flag`);
+    const call = { type: "tool_call", toolUseId: "same", toolName: "request_clarification", input: { title: "请先回答" }, ...(completed ? { completed: true } : {}) };
+    const script = `const fs=require('node:fs');const first=!fs.existsSync(process.argv[1]);fs.writeFileSync(process.argv[1],'1');console.log(JSON.stringify({type:'session',sessionId:'native-retry'}));if(first){console.log(process.argv[2]);console.error('API Error: 529 Overloaded');process.exitCode=1;}else console.log(JSON.stringify({type:'result',answer:'请先回答'}));process.stdin.resume();`;
+    const fake = { id: "claude", command: process.execPath, displayName: "重试探针", capabilities: { subagents: false }, parseEvents: line => { try { return [JSON.parse(line)]; } catch { return []; } } };
+    const resumes = [];
+    fake.buildArgs = () => ["-e", script, flag, JSON.stringify(call)];
+    fake.buildResumeArgs = (_p, id) => { resumes.push(id); return fake.buildArgs(); };
+    const result = await withFastCliRetry(() => runCli({ adapter: fake, cwd: process.cwd(), prompt: "测试" }));
+    assert.deepEqual(resumes, ["native-retry"]);
+    assert.equal(result.stats.retries, 1);
+    assert.equal(result.toolCalls?.length ?? 0, completed ? 1 : 0);
+    if (completed) assert.equal(result.toolCalls[0].toolUseId, "1:same");
+  }
+});
+
+await t("确认请求后的重试最终失败或取消，不能偷偷返回待派发结果", async () => {
+  const { runCli } = await R("cli/runner.js");
+  for (const cancel of [true, false]) {
+    const flag = join(dir, `retry-app-final-${cancel}.flag`);
+    const script = `const fs=require('node:fs');const first=!fs.existsSync(process.argv[1]);fs.writeFileSync(process.argv[1],'1');console.log(JSON.stringify({type:'session',sessionId:'native-retry-final'}));if(first)console.log(JSON.stringify({type:'tool_call',toolUseId:'c',toolName:'dispatch_task',input:{task:'不能派发'},completed:true}));console.error(first?'API Error: 529 Overloaded':'不可重试的失败');process.exitCode=1;process.stdin.resume();`;
+    let starts = 0;
+    const fake = { id: "claude", command: process.execPath, displayName: "最终失败探针", capabilities: { subagents: false },
+      buildArgs: () => { starts++; return ["-e", script, flag]; }, buildResumeArgs() { return this.buildArgs(); },
+      parseEvents: line => { try { return [JSON.parse(line)]; } catch { return []; } },
+    };
+    const controller = new AbortController();
+    await assert.rejects(() => withFastCliRetry(() => runCli({ adapter: fake, cwd: process.cwd(), prompt: "测试", signal: controller.signal,
+      onRetry: () => { if (cancel) controller.abort(); },
+    })), cancel ? /529/ : /不可重试的失败/);
+    assert.equal(starts, cancel ? 1 : 2);
+  }
+});
+
+await t("DSH 原生 opaque 调用标识不能撤销桥接成功请求，开始结束仍正确配对", async () => {
+  const { runCli } = await R("cli/runner.js");
+  const { TaskProgressTracker } = await R("core/task-progress.js");
+  const app = dshApp("request_clarification", { title: "保留已确认请求" }, { callId: "clarify" });
+  const appId = dshLine(app).find(e => e.type === "tool_call").toolUseId;
+  const tracker = new TaskProgressTracker();
+  const result = await runCli({ adapter: dshProcess([
+    app,
+    { type: "tool_call", callId: appId, tool: "read", input: { file_path: "/other.ts" } },
+    { type: "tool_result", callId: appId, status: "error" },
+    { type: "final", text: "等待确认" },
+  ]), prompt: "测试", cwd: process.cwd(), onEvent: event => tracker.accept(event) });
+  assert.equal(result.toolCalls.length, 1);
+  assert.equal(result.toolCalls[0].input.title, "保留已确认请求");
+  assert.equal(tracker.snapshot().completedCount, 2, "原生开始/结束标识未同步归一化");
+});
 console.log(`\n${pass} passed`);

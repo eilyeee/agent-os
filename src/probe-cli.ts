@@ -10,7 +10,7 @@ const stamp = () => `[${((Date.now() - t0) / 1000).toFixed(1)}s]`;
 const adapters = listCliAdapters();
 
 createInterface({ input: process.stdin }).on("line", (line) => {
-  // 两种引擎的解析器都试一遍，管道里是谁都能读。
+  // 所有引擎的解析器都试一遍，管道里是谁都能读。
   for (const adapter of adapters) {
     for (const event of adapter.parseEvents(line)) {
       switch (event.type) {

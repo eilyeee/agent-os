@@ -11,6 +11,7 @@ export function executeCli(
   onEvent?: (event: CliEvent) => void,
   limits?: { idleTimeoutMinutes: number; maxRuntimeMinutes: number },
   onRetry?: (attempt: number, error: Error) => void,
+  onSession?: (sessionId: string) => Promise<void>,
 ): Promise<CliRunResult> {
   return runCli({
     adapter,
@@ -26,5 +27,6 @@ export function executeCli(
         }
       : {}),
     ...(onRetry ? { onRetry } : {}),
+    ...(onSession ? { onSession } : {}),
   });
 }

@@ -78,6 +78,11 @@ export async function runProductDocumentComment(options: {
             }
           : undefined;
       })(),
+      undefined,
+      async (nativeId) => {
+        if (runtime.activeRuns.get(session.id)?.controller !== controller) throw new Error("评论任务已结束，无法更新原生会话绑定");
+        await runtime.sessions.setCliSessionId(session.id, nativeId);
+      },
     );
     if (result.sessionId) {
       await runtime.sessions.setCliSessionId(session.id, result.sessionId);

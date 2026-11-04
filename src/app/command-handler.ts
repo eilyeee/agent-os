@@ -69,7 +69,7 @@ export async function handleSessionCommand(options: {
     return "handled";
   }
 
-  // 两种 CLI 的 session id 不互通，话题创建时定死引擎，想换只能新开话题。
+  // 各 CLI 的 session id 不互通，话题创建时定死引擎，想换只能新开话题。
   if (!isNew && cliRequest && cliRequest.cliId !== session.cliId) {
     await bot.reply(
       msg.messageId,
@@ -264,7 +264,7 @@ export async function handleSessionCommand(options: {
       buildSessionNoticeCard({
         title: "新会话已就绪",
         template: "green",
-        detail: `下一条任务会由 ${cliAdapter.displayName} 开启全新的 CLI 会话。\n\n旧会话仍然保留，可以随时用 \`/resume\` 找回来。`,
+        detail: `下一条任务会由 ${cliAdapter.displayName} 开启全新的 CLI 会话。${cliAdapter.capabilities.nativeHistory === false ? "" : "\n\n旧会话仍然保留，可以随时用 `/resume` 找回来。"}`,
       }),
       hasThread,
     );
@@ -309,6 +309,11 @@ export async function handleSessionCommand(options: {
   }
 
   if (command.name === "compact") {
+    if (cliAdapter.capabilities.nativeCompact === false) {
+      const plan = cliAdapter.buildCompactPlan(session.cliSessionId ?? "");
+      if (plan.protocol === "unsupported") await bot.reply(msg.messageId, plan.message, hasThread);
+      return "handled";
+    }
     if (!session.cliSessionId) {
       await bot.reply(
         msg.messageId,

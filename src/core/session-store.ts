@@ -14,7 +14,8 @@ const SessionSchema = z.object({
   botId: z.string().min(1),
   threadId: z.string().min(1),
   chatId: z.string().min(1),
-  cliId: z.enum(["claude", "codex"]),
+  // 只扩展取值，不改写已有 claude/codex 标识；原生会话 ID 不能跨引擎迁移。
+  cliId: z.enum(["claude", "codex", "dsh"]),
   cliSessionId: z.string().min(1).optional(),
   /**
    * 这个话题是由哪条定时任务开出来的。挂在**会话**上而不是挂在某一轮上：

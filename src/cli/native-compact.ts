@@ -264,6 +264,7 @@ export function compactCliSession(
     options.sessionId,
     options.instructions,
   );
+  if (plan.protocol === "unsupported") return Promise.reject(new Error(plan.message));
   return plan.protocol === "claude-stream-json"
     ? runClaudeCompact(plan, options)
     : runCodexCompact(plan, options);

@@ -2658,4 +2658,265 @@ await t("[交接接线] 自动返回的票据保留原群话题和递增轮次�
   assert.ok(rt.taskRecords.list().every((row) => row.chatId === scope.chatId && row.threadId === scope.threadId));
 });
 
+
+console.log("DSH 编排");
+/** 保留真实 DSH 协议解析，仅用脚本子进程替代模型执行。 */
+const dshBridge = (kind, fields = {}) => ({ type: "agent_os.bridge", version: 1, kind, ...(kind === "app_tool" ? { executionId: "1" } : {}), ...fields });
+async function wireDsh(events, { ready = true, exitCode = 0 } = {}) {
+  const rt = await makeRuntime();
+  const real = getCliAdapter("dsh");
+  const adapter = createFakeAdapter([...(ready ? [dshBridge("ready")] : []), ...events], { id: "dsh", capabilities: real.capabilities, exitCode });
+  adapter.parseEvents = (line) => real.parseEvents(line);
+  rt.getAdapter = (id) => id === "dsh" ? adapter : getCliAdapter(id);
+  const br = rt.botRuntimes.get("developer");
+  return { rt, adapter, br, handle: createMessageHandler({ runtime: rt, config: br.config }), out: outbound(br.bot) };
+}
+await t("/dsh 新话题执行后继续追问：保留引擎、原生会话和任务历史", async () => {
+  const { rt, adapter, br, handle } = await wireDsh([
+    { type: "session", sessionId: "session-dsh-integration" },
+    { type: "status", phase: "step_end", usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } },
+    { type: "status", phase: "turn_end", reason: { kind: "completed" } },
+    { type: "final", text: "DSH 完成" },
+  ]);
+  const first = userMessage("/dsh 检查项目", { messageId: "om_dsh_first", threadId: "omt_dsh" });
+  await handle(first, br.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "DSH 首轮完成" });
+  const session = rt.sessions.get(rt.taskRecords.list()[0].sessionId);
+  assert.equal(session.cliId, "dsh");
+  assert.equal(session.cliSessionId, "session-dsh-integration");
+  await handle(userMessage("继续处理", { messageId: "om_dsh_next", threadId: first.threadId }), br.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 2, { label: "DSH 续接完成" });
+  assert.equal(adapter.prompts[1].kind, "resume");
+  assert.equal(adapter.prompts[1].sessionId, "session-dsh-integration");
+  assert.ok(rt.taskRecords.list().every((row) => row.cliId === "dsh" && row.status === "success" && row.totalTokens === 15));
+  assert.equal(rt.sessions.get(session.id).status, "idle");
+});
+await t("DSH 的 MCP 澄清请求经过真实编排变成人类待办，空答案也能收尾", async () => {
+  const { rt, br, handle, out } = await wireDsh([
+    { type: "session", sessionId: "session-dsh-clarify" },
+    { type: "tool_call", callId: "clarify", tool: "mcp__agent_os__request_clarification", input: {
+      title: "实现范围", questions: [{ id: "scope", prompt: "选择范围", options: [{ id: "one", label: "仅本地" }, { id: "two", label: "包含同步" }] }],
+    } },
+    { type: "tool_result", callId: "clarify", status: "completed" },
+    dshBridge("app_tool", { rootSessionId: "session-dsh-clarify", sessionId: "child-ask", callId: "clarify", tool: "mcp__agent_os__request_clarification", failed: false, input: {
+      title: "实现范围", questions: [{ id: "scope", prompt: "选择范围", options: [{ id: "one", label: "仅本地" }, { id: "two", label: "包含同步" }] }],
+    } }),
+    { type: "final", text: "" },
+  ]);
+  await handle(userMessage("/dsh 实现功能", { threadId: "omt_dsh_clarify" }), br.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "DSH 澄清挂起" });
+  assert.equal(rt.taskRecords.list()[0].status, "waiting");
+  assert.ok(JSON.stringify(out.lastUpdate()).includes("选择范围"));
+  const record = rt.taskRecords.list()[0];
+  assert.equal(rt.sessions.get(record.sessionId).status, "idle");
+});
+await t("DSH /compact、/resume、/new 的能力提示准确且不启动任务", async () => {
+  const rt = await makeRuntime();
+  const msg = userMessage("/compact", { threadId: "omt_dsh_commands" });
+  const { session } = await rt.sessions.resolve(msg, "dsh", "developer", process.cwd());
+  await rt.sessions.transition(session.id, "idle");
+  await rt.sessions.setCliSessionId(session.id, "session-commands");
+  for (const [text, expected] of [["/compact", /原生自动压缩/], ["/resume", /原话题会自动续接/]]) {
+    const { outcome, bot } = await runCommand(rt, rt.sessions.get(session.id), msg, text);
+    assert.equal(outcome, "handled");
+    assert.match(outbound(bot).lastText(), expected);
+  }
+  const { outcome, bot } = await runCommand(rt, rt.sessions.get(session.id), msg, "/new");
+  assert.equal(outcome, "handled");
+  assert.equal(rt.sessions.get(session.id).cliSessionId, undefined);
+  assert.ok(!JSON.stringify(outbound(bot).lastCard()).includes("找回来"));
+  assert.equal(rt.activeRuns.size, 0);
+  assert.equal(rt.taskRecords.size, 0);
+});
+
+
+/** 保留假进程参数组装与调用记录，只把下一次续接的事件换成成功终态。 */
+function finishDshOnResume(adapter, sessionId) {
+  const build = adapter.buildResumeArgs.bind(adapter);
+  adapter.buildResumeArgs = (...args) => {
+    const argv = build(...args);
+    argv[2] = JSON.stringify([dshBridge("ready"), { type: "session", sessionId }, { type: "final", text: "继续完成" }]);
+    argv[3] = "0";
+    return argv;
+  };
+}
+await t("DSH 首轮失败后绑定与历史保留原生 ID，重启再追问仍续接", async () => {
+  const { rt, adapter, br, handle } = await wireDsh([
+    { type: "session", sessionId: "native-failure" }, { type: "error", message: "不可重试的配置错误" },
+  ]);
+  const file = join(dir, `s${n}.json`);
+  const msg = userMessage("/dsh 检查失败续接", { threadId: "omt_dsh_failure" });
+  await handle(msg, br.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "DSH 失败收尾" });
+  const record = rt.taskRecords.list()[0];
+  assert.equal(record.status, "failed");
+  assert.equal(record.cliSessionId, "native-failure");
+  assert.equal(rt.sessions.get(record.sessionId).cliSessionId, "native-failure");
+  rt.sessions = await SessionManager.open({ store: new JsonSessionStore(file) });
+  assert.equal(rt.sessions.get(record.sessionId).cliSessionId, "native-failure", "只留在内存不算保存");
+  finishDshOnResume(adapter, "native-failure");
+  await handle(userMessage("继续修复", { messageId: "om_continue_fail", threadId: msg.threadId }), br.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 2, { label: "DSH 重启后续接" });
+  assert.equal(adapter.prompts[1].kind, "resume");
+  assert.equal(adapter.prompts[1].sessionId, "native-failure");
+});
+await t("DSH 首轮取消后保留原生 ID，下一条消息继续同一上下文", async () => {
+  const { rt, adapter, br, handle } = await wireDsh([
+    { type: "session", sessionId: "native-cancelled", __delayMs: 10_000 }, { type: "final", text: "不应自然结束" },
+  ]);
+  const msg = userMessage("/dsh 检查取消续接", { threadId: "omt_dsh_cancelled" });
+  await handle(msg, br.bot);
+  const { session } = await rt.sessions.resolve(msg, "dsh", "developer", process.cwd());
+  await waitFor(() => rt.sessions.get(session.id).cliSessionId === "native-cancelled", { label: "中途保存原生绑定" });
+  const action = createCardActionHandler({ runtime: rt, config: br.config });
+  await action(cardAction({ action: "abort_task", sessionId: session.id }));
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "取消完成" });
+  assert.equal(rt.taskRecords.list()[0].status, "cancelled");
+  assert.equal(rt.taskRecords.list()[0].cliSessionId, "native-cancelled");
+  assert.equal(rt.sessions.get(session.id).status, "idle");
+  finishDshOnResume(adapter, "native-cancelled");
+  await handle(userMessage("继续", { messageId: "om_continue_cancelled", threadId: msg.threadId }), br.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 2, { label: "取消后续接" });
+  assert.equal(adapter.prompts[1].kind, "resume");
+  assert.equal(adapter.prompts[1].sessionId, "native-cancelled");
+});
+await t("DSH 子任务的澄清答案续跑主会话，不把子任务 ID 写进绑定", async () => {
+  const { rt, adapter, br, handle, out } = await wireDsh([
+    { type: "session", sessionId: "native-root" },
+    dshBridge("app_tool", { rootSessionId: "native-root", sessionId: "native-child", callId: "child-call", tool: "mcp__agent_os__request_clarification", failed: false,
+      input: { title: "子任务澄清", questions: [{ id: "scope", prompt: "选择范围", options: [{ id: "one", label: "仅本地" }, { id: "two", label: "包含同步" }] }] } }),
+    { type: "final", text: "等待用户" },
+  ]);
+  const msg = userMessage("/dsh 完成任务", { threadId: "omt_dsh_child_human" });
+  await handle(msg, br.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "子任务请求挂起" });
+  const record = rt.taskRecords.list()[0];
+  assert.equal(record.status, "waiting");
+  assert.equal(rt.sessions.get(record.sessionId).cliSessionId, "native-root");
+  const choice = out.callbacks(out.lastUpdate()).find(v => v.action === "answer_clarification");
+  assert.ok(choice);
+  finishDshOnResume(adapter, "native-root");
+  await createCardActionHandler({ runtime: rt, config: br.config })(cardAction(choice));
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 2, { label: "回答后续跑主任务" });
+  assert.equal(adapter.prompts[1].kind, "resume");
+  assert.equal(adapter.prompts[1].sessionId, "native-root");
+  assert.equal(rt.taskRecords.list()[1].status, "success");
+});
+await t("DSH 工具未就绪与绑定写盘失败均报告失败并释放占位", async () => {
+  for (const failure of ["ready", "persist"]) {
+    const { rt, br, handle, out } = await wireDsh([
+      { type: "session", sessionId: `native-${failure}` }, { type: "final", text: "不能掩盖错误" },
+    ], { ready: failure !== "ready" });
+    if (failure === "persist") rt.sessions.setCliSessionId = async () => { throw new Error("绑定写盘失败"); };
+    await handle(userMessage("/dsh 验证启动失败", { threadId: `omt_dsh_${failure}` }), br.bot);
+    await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: `${failure} 失败收尾` });
+    assert.equal(rt.taskRecords.list()[0].status, "failed");
+    assert.equal(rt.sessions.get(rt.taskRecords.list()[0].sessionId).status, "idle");
+    assert.equal(out.lastUpdate().header.template, "red");
+  }
+});
+
+
+await t("CLI 已退出但会话绑定仍在保存时停止，不得继续派发队友", async () => {
+  const { rt, br, handle } = await wireDsh([
+    { type: "session", sessionId: "native-stop-before-handoff" },
+    dshBridge("app_tool", { rootSessionId: "native-stop-before-handoff", sessionId: "native-stop-before-handoff", callId: "dispatch", tool: "mcp__agent_os__dispatch_task", failed: false, input: { toBotId: "reviewer", task: "不得在取消后派发" } }),
+    { type: "final", text: "交给队友" },
+  ]);
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; });
+  const saving = new Promise(resolve => { started = resolve; });
+  const save = rt.sessions.setCliSessionId.bind(rt.sessions);
+  rt.sessions.setCliSessionId = async (...args) => { started(); await gate; return save(...args); };
+  const msg = userMessage("/dsh 派活前停止", { threadId: "omt_dsh_stop_before_dispatch" });
+  await handle(msg, br.bot); await saving;
+  const { session } = await rt.sessions.resolve(msg, "dsh", "developer", process.cwd());
+  await new Promise(resolve => setTimeout(resolve, 150)); // 毫秒：CLI 结束后仍保留绑定写盘的窗口。
+  await createCardActionHandler({ runtime: rt, config: br.config })(cardAction({ action: "abort_task", sessionId: session.id }));
+  release();
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "保存窗口取消收尾" });
+  assert.equal(rt.taskRecords.list()[0].status, "cancelled");
+  assert.equal(rt.collaborationInbox.size, 0, "用户已停止仍给队友投递了交接单");
+  assert.equal(rt.sessions.get(session.id).status, "idle");
+  assert.equal(rt.sessions.get(session.id).cliSessionId, "native-stop-before-handoff");
+});
+
+await t("异常桥接同时确认两个子任务请求时明确失败，不只展示最后一项", async () => {
+  const { rt, br, handle, out } = await wireDsh([
+    { type: "session", sessionId: "native-too-many" },
+    ...["first", "second"].map((id, i) => dshBridge("app_tool", {
+      rootSessionId: "native-too-many", sessionId: `child-${id}`, callId: id, executionId: String(i + 1), tool: "mcp__agent_os__request_clarification", failed: false,
+      input: { title: id, questions: [{ id: "scope", prompt: `问题${id}`, options: [{ id: "one", label: "选项一" }, { id: "two", label: "选项二" }] }] },
+    })),
+    { type: "final", text: "不能只留最后一题" },
+  ]);
+  await handle(userMessage("/dsh 检查重复请求", { threadId: "omt_dsh_too_many" }), br.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "多请求明确失败" });
+  assert.equal(rt.taskRecords.list()[0].status, "failed");
+  assert.match(rt.taskRecords.list()[0].failureReason, /多个成功的应用工具请求/);
+  assert.equal(out.lastUpdate().header.template, "red");
+  assert.ok(!out.callbacks(out.lastUpdate()).some(v => v.action === "answer_clarification"));
+});
+
+async function withFastCliRetry(fn) {
+  const original = globalThis.setTimeout;
+  // 毫秒：只加速本组的退避，保留子进程和编排的真实执行顺序。
+  globalThis.setTimeout = (fn, ms, ...args) => original(fn, ms === 20_000 ? 0 : ms, ...args);
+  try { return await fn(); } finally { globalThis.setTimeout = original; }
+}
+await t("DSH 已提交的澄清跨529续接保留，收尾重试不丢失人类待办", async () => {
+  const { rt, adapter, br, handle, out } = await wireDsh([
+    { type: "session", sessionId: "native-retry-waiting" },
+    dshBridge("app_tool", { rootSessionId: "native-retry-waiting", sessionId: "child-ask", callId: "ask", tool: "mcp__agent_os__request_clarification", failed: false,
+      input: { title: "重试仍须回答", questions: [{ id: "scope", prompt: "保留这个问题", options: [{ id: "one", label: "选项一" }, { id: "two", label: "选项二" }] }] } }),
+    { type: "error", message: "API Error: 529 Overloaded" },
+  ], { exitCode: 1 });
+  finishDshOnResume(adapter, "native-retry-waiting");
+  await withFastCliRetry(async () => {
+    await handle(userMessage("/dsh 检查重试待办", { threadId: "omt_dsh_retry_waiting" }), br.bot);
+    await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "重试后的澄清待办" });
+  });
+  assert.equal(rt.taskRecords.list()[0].status, "waiting");
+  assert.equal(rt.taskRecords.list()[0].retries, 1);
+  assert.ok(JSON.stringify(out.lastUpdate()).includes("保留这个问题"));
+  assert.equal(adapter.prompts[1].kind, "resume");
+});
+await t("跨重试复用执行标识的两个成功请求不能覆盖成一项", async () => {
+  const question = title => ({ title, questions: [{ id: "scope", prompt: title, options: [{ id: "one", label: "选项一" }, { id: "two", label: "选项二" }] }] });
+  const frame = title => dshBridge("app_tool", { rootSessionId: "native-retry-conflict", sessionId: "native-retry-conflict", callId: "same", tool: "mcp__agent_os__request_clarification", failed: false, input: question(title) });
+  const { rt, adapter, br, handle } = await wireDsh([
+    { type: "session", sessionId: "native-retry-conflict" }, frame("第一项"), { type: "error", message: "API Error: 529 Overloaded" },
+  ], { exitCode: 1 });
+  const build = adapter.buildResumeArgs.bind(adapter);
+  adapter.buildResumeArgs = (...args) => { const argv = build(...args); argv[2] = JSON.stringify([dshBridge("ready"), frame("第二项"), { type: "final", text: "不能覆盖" }]); argv[3] = "0"; return argv; };
+  await withFastCliRetry(async () => {
+    await handle(userMessage("/dsh 检查跨重试冲突", { threadId: "omt_dsh_retry_conflict" }), br.bot);
+    await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "跨重试冲突明确失败" });
+  });
+  assert.equal(rt.taskRecords.list()[0].status, "failed");
+  assert.match(rt.taskRecords.list()[0].failureReason, /多个成功的应用工具请求/);
+
+  // 两次失败都已有确认请求，第三次只回终态：样本必须跨过缓存 Map 自身的覆盖边界。
+  const second = await wireDsh([
+    { type: "session", sessionId: "native-retry-conflict" }, frame("缓存第一项"), { type: "error", message: "API Error: 529 Overloaded" },
+  ], { exitCode: 1 });
+  let resumed = 0;
+  const resume = second.adapter.buildResumeArgs.bind(second.adapter);
+  second.adapter.buildResumeArgs = (...args) => {
+    resumed++;
+    const argv = resume(...args);
+    argv[2] = JSON.stringify(resumed === 1
+      ? [dshBridge("ready"), frame("缓存第二项"), { type: "error", message: "API Error: 529 Overloaded" }]
+      : [dshBridge("ready"), { type: "final", text: "不能只留第二项缓存" }]);
+    argv[3] = resumed === 1 ? "1" : "0";
+    return argv;
+  };
+  await withFastCliRetry(async () => {
+    await second.handle(userMessage("/dsh 检查两次失败缓存", { threadId: "omt_dsh_retry_cached_twice" }), second.br.bot);
+    await waitFor(() => idle(second.rt) && second.rt.taskRecords.size === 1, { label: "两次失败缓存冲突" });
+  });
+  assert.equal(resumed, 2);
+  assert.equal(second.rt.taskRecords.list()[0].status, "failed");
+  assert.match(second.rt.taskRecords.list()[0].failureReason, /多个成功的应用工具请求/);
+});
 console.log(`\n${pass} passed`);

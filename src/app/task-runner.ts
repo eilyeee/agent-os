@@ -260,6 +260,10 @@ export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
           retryNote = `⚠️ 上游临时故障，正在重试（第 ${attempt} 次）：${error.message.slice(0, 80)}`;
           renderProgress();
         },
+        async (nativeId) => {
+          if (runtime.activeRuns.get(session.id)?.controller !== controller) throw new Error("任务已结束，无法更新原生会话绑定");
+          await runtime.sessions.setCliSessionId(session.id, nativeId);
+        },
       );
 
   try {
@@ -267,7 +271,7 @@ export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
     runResult = result;
     clearInterval(heartbeat);
 
-    if (!isCompacting && result.sessionId) {
+    if (!isCompacting && result.sessionId && runtime.sessions.get(session.id)?.cliSessionId !== result.sessionId) {
       await runtime.sessions.setCliSessionId(session.id, result.sessionId);
     }
     if (!isCompacting && result.stats?.contextWindowTokens) {
@@ -427,8 +431,8 @@ async function recordTaskRun(options: {
 }): Promise<void> {
   const { ctx, status, startedAt, progress, result } = options;
   const { session } = ctx;
-  // ctx.session 是开跑前的快照，本轮新建的 CLI 会话 id 只在结果里。
-  const cliSessionId = result?.sessionId ?? session.cliSessionId;
+  // ctx.session 是开跑前的快照；失败轮也要从最新绑定取回已经落盘的原生标识。
+  const cliSessionId = result?.sessionId ?? ctx.runtime.sessions.get(session.id)?.cliSessionId ?? session.cliSessionId;
   try {
     await ctx.runtime.taskRecords.append({
       taskId: ctx.taskId,

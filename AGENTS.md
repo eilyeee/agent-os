@@ -7,7 +7,7 @@ Guidance for AI coding agents working in this repository.
 ## What this project is
 
 Agent OS turns Lark/Feishu into a command deck for headless AI coding CLIs
-(Claude Code and Codex). One Lark thread is one task; multiple bots hand work to
+(Claude Code, Codex and DeepSeek Harness). One Lark thread is one task; multiple bots hand work to
 each other; a scheduler dispatches work on its own.
 
 **We do not call model APIs.** There is no AI SDK dependency and there never
@@ -96,6 +96,8 @@ src/cli/    engines            引擎差异，收敛成统一 CliEvent
   runner.ts                    通用 Runner：超时 / 取消 / 事件分发
   claude-adapter.ts            Claude Code 参数与 stream-json 解析
   codex-adapter.ts             Codex 参数与 JSONL 解析
+  dsh-adapter.ts               DeepSeek Harness headless 参数、JSONL 与会话续接
+  dsh-runtime-bridge.ts         DSH 原生插件源码：工具就绪门、任务树校验与无损结果通道
   registry.ts                  引擎注册表
   app-tools.ts                 应用工具名 + MCP 挂载参数
   native-sessions.ts           读取引擎原生历史会话
@@ -155,7 +157,7 @@ Two session layers, never conflate them:
 
 - `session.id` — ours. Routes messages, tracks task state.
 - `session.cliSessionId` — the CLI's. Restores model conversation context via
-  `claude --resume <id>` or `codex exec resume <id>`.
+  `claude --resume <id>`, `codex exec resume <id>` or `dsh --profile headless --session-id <id>`.
 
 State machine, enforced by `ALLOWED_TRANSITIONS` (illegal transitions throw):
 
@@ -724,3 +726,16 @@ Written for the humans *and* the agents who come next.
 - /resume 明明有自己派发的历史却显示空 → 先截取最近 8 条，再按来源过滤，终端历史把合法会话挤掉 → 来源过滤必须发生在限量之前，原生分页接口按游标继续取得合格条目。
 - 用极大数测试日期范围，删掉日期校验测试仍绿 → 样本先被安全整数范围拒绝，根本没走到 Date 边界 → 用仍是安全整数、但超过 Date 支持范围的秒数，分别证明整数与日期守卫有效。
 - 交接范围回归只测显式派发，自动返回丢字段仍全绿 → 三个调用点共用服务，却各自组装参数，只测一条链路不能证明其余接线 → 自动互审与自动返回也要从真实入口验证票据可被正确话题领取。
+
+- DSH headless 加载时权限插件不激活 → 只把审批改成 never，原生 preset 仍组合 workspace-write + ask → 临时 patch 同时配置 sandbox、approval 和与它们匹配的 defaultPreset。
+- DSH 少报一步用量却显示了看似完整的总消耗 → 把被截断的 step_end 整行忽略，只累加剩下的步骤 → 仍消费步骤结束，缺失的计数要标记不完整，不展示部分和。
+- MCP 路径测试在 Windows 上误报挂载失败 → 用带正斜杠的字符串直接匹配 fileURLToPath 返回的原生路径 → 测试断言前统一路径分隔符。
+- DSH 的子任务和 PTC 调用返回“已送达”，飞书却没有待办 → headless JSONL 只投影主会话普通工具调用 → 在原生 tools/result 最终结果上桥接完整参数，并校验调用方属于当前任务树。
+- DSH 的 failOnStartupError 没拦住模型执行 → MCP 是可选插件，失败只记启动警告 → 把桥接就绪服务加到必需的 headless-runner 注入依赖，五个工具没齐就不启动任务。
+- 首轮执行失败后“继续”重新开了上下文 → 原生标识只在成功 result 后才落盘 → 收到 session 立即串行保存，成功、失败和取消都等写入完成后再释放占位。
+- 不同文件被报原地打转、真实验证却被标未验证 → 适配时丢了工具参数区别和原生 preset 身份 → 展示补详情，重复判据用完整参数指纹，验证角色只认已创建子任务的原生身份。
+- CLI 已退出、绑定仍在写盘时点停止却继续派活 → 成功结算在等待写盘前就移除了取消监听 → 写盘完成后再次检查取消与超时，再结算成功。
+- 多个子任务都收到“已提交”，飞书只显示最后一项 → 并行工具请求碰到了编排单轮只接一项的契约 → 原生守卫用不可伪造的执行 token 同步占位，成功保留、失败释放，其他调用明确拒绝；桥接另分配执行标识，不能靠模型 callId 去重。
+- 工具已确认的问题在 529 续接成功后消失 → 重试只保留会话 id，丢掉失败尝试中已成功的应用请求 → 有界重试内保留带成功确认的请求，跨尝试加标识，取消和最终失败不交付缓存。
+- 普通工具失败误删已确认的 MCP 请求 → 把原生 opaque callId 与桥接复合标识放进同一个命名空间 → 原生和桥接分别加来源前缀，桥接各组成字段用无歧义元组编码。
+- 给缓存键加尝试序号的测试删了实现仍绿 → 只有一次失败加一次成功，第二项没经过缓存 Map → 用两次已确认后失败、第三次仅终态的样本跨过 Map 覆盖边界。

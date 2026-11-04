@@ -30,7 +30,7 @@ const COMMAND_RE = new RegExp(`^${MENTION}${SLASH}(close|status|help|history|cos
 const CD_RE = new RegExp(`^${MENTION}${SLASH}cd(?:\\s+([\\s\\S]+?))?\\s*$`);
 const COMPACT_RE = new RegExp(`^${MENTION}${SLASH}compact(?:\\s+([\\s\\S]+?))?\\s*$`);
 const SCHEDULE_RE = new RegExp(`^${MENTION}${SLASH}schedule(?:\\s+([\\s\\S]+?))?\\s*$`);
-const CLI_REQUEST_RE = new RegExp(`^${MENTION}${SLASH}(claude|codex)(?:\\s+([\\s\\S]*))?$`);
+const CLI_REQUEST_RE = new RegExp(`^${MENTION}${SLASH}(claude|codex|dsh)(?:\\s+([\\s\\S]*))?$`);
 
 export function parseCommand(text: string): SlashCommand | undefined {
   const value = text.trim();
@@ -82,7 +82,7 @@ export function parseCliRequest(text: string): CliRequest | undefined {
 /** 全部命令名，用于识别「敲错的命令」。与上面几条正则同源，加命令时一起改。 */
 export const KNOWN_COMMANDS = [
   "close", "status", "help", "history", "cost", "new", "resume", "team",
-  "cd", "compact", "schedule", "claude", "codex",
+  "cd", "compact", "schedule", "claude", "codex", "dsh",
 ] as const;
 
 /**

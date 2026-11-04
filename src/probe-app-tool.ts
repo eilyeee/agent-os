@@ -1,6 +1,6 @@
 /**
  * 应用工具探针：不经过飞书，单独验证 MCP 工具链。
- * 用法：pnpm probe:tool <claude|codex> [工作目录]
+ * 用法：pnpm probe:tool <claude|codex|dsh> [工作目录]
  */
 import { resolve } from "node:path";
 import { getCliAdapter, parseCliId } from "./cli/registry.js";

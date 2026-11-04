@@ -71,7 +71,7 @@ const TaskRecordSchema = z.object({
   /** Agent OS 自己的会话 id，和下面的 cliSessionId 不是一回事。 */
   sessionId: z.string().min(1),
   // 新增引擎时这里要一起放宽，否则该引擎的记录会在加载时被当成坏行丢掉。
-  cliId: z.enum(["claude", "codex"]),
+  cliId: z.enum(["claude", "codex", "dsh"]),
   cliSessionId: z.string().min(1).optional(),
   workspaceDir: z.string().min(1),
   origin: z.enum(TASK_RUN_ORIGINS),

@@ -281,9 +281,11 @@ function listCodexSessions(
 export function listNativeCliSessions(
   options: ListNativeCliSessionsOptions,
 ): Promise<CliSessionSummary[]> {
-  return options.adapter.id === "claude"
-    ? listClaudeSessions(options)
-    : listCodexSessions(options);
+  switch (options.adapter.id) {
+    case "claude": return listClaudeSessions(options);
+    case "codex": return listCodexSessions(options);
+    case "dsh": return Promise.reject(new Error("headless 模式暂不提供历史会话列表。原话题会自动续接；需要新上下文时使用 /new。"));
+  }
 }
 
 /**

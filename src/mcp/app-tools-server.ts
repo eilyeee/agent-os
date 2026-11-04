@@ -1,5 +1,5 @@
 /**
- * Agent OS 的本地 MCP Server：向 Claude Code 和 Codex 暴露同一套应用工具。
+ * Agent OS 的本地 MCP Server：向执行引擎暴露同一套应用工具。
  * 只定义参数契约，不含任何执行逻辑——工具调用一律交回 Agent OS 处理。
  * 走 stdio，不监听端口，由各个 CLI 在启动时拉起。
  */

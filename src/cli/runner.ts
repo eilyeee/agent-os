@@ -6,6 +6,7 @@ import type {
   CliRunResult,
   CliRunStats,
   CliToolCall,
+  CliUsageStats,
 } from "./types.js";
 import { promptInputForPlatform } from "./types.js";
 import { killCli, spawnCli } from "./spawn-cli.js";
@@ -45,6 +46,8 @@ const WRITE_TOOLS = new Set([
   "NotebookEdit",
   "MultiEdit",
   "apply_patch",
+  "edit",
+  "write",
 ]);
 
 /** 上游临时故障最多重试几次。 */
@@ -85,6 +88,8 @@ export interface RunCliOptions {
   onEvent?: (event: CliEvent) => void;
   /** 因上游临时故障重试时通知调用方，便于在卡片上说明。 */
   onRetry?: (attempt: number, error: Error) => void;
+  /** 原生标识一到就落盘；失败和取消也要能继续原上下文。 */
+  onSession?: (sessionId: string) => Promise<void>;
 }
 
 /**
@@ -95,9 +100,10 @@ export interface RunCliOptions {
 export async function runCli(options: RunCliOptions): Promise<CliRunResult> {
   let sessionId = options.sessionId;
   let lastError: Error | undefined;
+  const retainedToolCalls = new Map<string, CliToolCall>();
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    const discovered: { sessionId?: string } = {};
+    const discovered: { sessionId?: string; completedToolCalls?: CliToolCall[] } = {};
     try {
       const result = await runCliOnce(
         { ...options, ...(sessionId ? { sessionId } : {}) },
@@ -106,13 +112,18 @@ export async function runCli(options: RunCliOptions): Promise<CliRunResult> {
       // 重试次数记进结果：一轮跑了 40 分钟，是一次跑完的还是断了两次接上的，
       // 事后翻历史时这是完全不同的两件事，光看耗时分不出来。
       if (attempt === 1) return result;
-      return { ...result, stats: { ...result.stats, retries: attempt - 1 } };
+      // 原生执行标识在每个 CLI 进程内唯一；跨重试还要带尝试序号，不能把两次提交合并。
+      const calls = [...retainedToolCalls.values(), ...(result.toolCalls ?? []).map(call => ({ ...call, toolUseId: `${attempt}:${call.toolUseId}` }))];
+      if (options.adapter.capabilities?.singleAppTool && calls.length > 1) throw new Error("本轮收到多个成功的应用工具请求，已停止派发。请合并请求后重试。");
+      return { ...result, ...(calls.length ? { toolCalls: calls } : {}), stats: { ...result.stats, retries: attempt - 1 } };
     } catch (error) {
       lastError = error as Error;
       // 这一次跑出来的会话 id 要留下，重试才能续上。
       if (discovered.sessionId) sessionId = discovered.sessionId;
       if (options.signal?.aborted) throw lastError;
       if (attempt >= MAX_ATTEMPTS || !isTransientFailure(lastError)) throw lastError;
+      // 只跨重试保留已确认成功的请求。工具开始通知可能尚未执行，绝不能冒充成功回执。
+      for (const call of discovered.completedToolCalls ?? []) retainedToolCalls.set(`${attempt}:${call.toolUseId}`, { ...call, toolUseId: `${attempt}:${call.toolUseId}` });
       console.warn(
         `[CLI] 上游临时故障，${RETRY_DELAY_MS / 1000}s 后重试（第 ${attempt + 1}/${MAX_ATTEMPTS} 次）：${lastError.message}`,
       );
@@ -126,7 +137,7 @@ export async function runCli(options: RunCliOptions): Promise<CliRunResult> {
 
 function runCliOnce(
   options: RunCliOptions,
-  discovered: { sessionId?: string },
+  discovered: { sessionId?: string; completedToolCalls?: CliToolCall[] },
 ): Promise<CliRunResult> {
   const {
     adapter,
@@ -166,8 +177,13 @@ function runCliOnce(
 
     const lines = createInterface({ input: child.stdout });
     let observedSessionId = sessionId;
+    let notifiedSessionId = sessionId;
+    let sessionWrites = Promise.resolve();
+    let appToolsReady = false;
     let observedAnswer: string | undefined;
     let observedStats: CliRunStats | undefined;
+    const stepUsage: CliUsageStats = {};
+    const incompleteUsage = new Set<keyof CliUsageStats>();
     // 观察到的子 Agent，按首次出现排序、去重。Set 天然保序。
     const observedSubagents = new Set<string>();
     // 改过文件没有。工具名由适配器归一化，这里只认这三个写操作。
@@ -178,9 +194,11 @@ function runCliOnce(
     let repeatCount = 0;
     let observedSpinning: string | undefined;
     const observedToolCalls = new Map<string, CliToolCall>();
+    const completedToolCalls = new Set<string>();
     let resultError: Error | undefined;
     let stderr = "";
     let settled = false;
+    let finishing = false;
     let timedOutReason: "idle" | "runtime" | undefined;
 
     // 只要还有输出就一直续期；每收到一行都重置。
@@ -221,14 +239,23 @@ function runCliOnce(
     const fail = (error: Error) => {
       if (settled) return;
       settled = true;
+      discovered.completedToolCalls = [...observedToolCalls.values()].filter(call => completedToolCalls.has(call.toolUseId));
       cleanup();
-      reject(error);
+      // 先等标识落盘，再释放会话占位；否则下一条消息可能抢在绑定保存前开启新上下文。
+      void sessionWrites.then(() => reject(error), reject);
     };
     const succeed = (result: CliRunResult) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(result);
+      if (settled || finishing) return;
+      finishing = true;
+      // CLI 退出不等于任务已结算：保存绑定期间仍可停止，不能提前移除取消监听再派活。
+      void sessionWrites.then(() => {
+        if (settled) return;
+        if (timedOutReason) return fail(timeoutError());
+        if (signal?.aborted) return fail(new Error(`${adapter.displayName} 执行已取消`));
+        settled = true;
+        cleanup();
+        resolve(result);
+      }, fail);
     };
 
     // 未监听的 stream error 是未捕获异常，会带走整个单进程运行时。
@@ -251,6 +278,7 @@ function runCliOnce(
     }
 
     lines.on("line", (line) => {
+      if (settled) return;
       // 任何一行都算「还活着」，包括解析不了的日志噪音。
       armIdleTimer();
       for (const event of adapter.parseEvents(line)) {
@@ -258,7 +286,18 @@ function runCliOnce(
         if ("sessionId" in event && event.sessionId) {
           observedSessionId = event.sessionId;
           discovered.sessionId = event.sessionId;
+          if (options.onSession && event.sessionId !== notifiedSessionId) {
+            notifiedSessionId = event.sessionId;
+            const nativeId = event.sessionId;
+            sessionWrites = sessionWrites.then(() => options.onSession!(nativeId));
+            void sessionWrites.catch((error: Error) => {
+              killCli(child);
+              fail(error);
+            });
+          }
         }
+        if (event.type === "ready") appToolsReady = true;
+        if (event.type === "subagent") observedSubagents.add(event.subagentType);
         if (event.type === "error") {
           resultError = new Error(event.message);
           continue;
@@ -272,7 +311,7 @@ function runCliOnce(
             lastSignature = undefined;
             repeatCount = 0;
           } else {
-            const signature = `${event.toolName}:${event.detail ?? ""}`;
+            const signature = `${event.toolName}:${event.inputHash ?? event.detail ?? ""}`;
             repeatCount = signature === lastSignature ? repeatCount + 1 : 1;
             lastSignature = signature;
             if (repeatCount >= SPIN_THRESHOLD && !observedSpinning) {
@@ -286,21 +325,39 @@ function runCliOnce(
           }
         }
         if (event.type === "tool_call") {
+          if (adapter.capabilities?.singleAppTool && observedToolCalls.size && !observedToolCalls.has(event.toolUseId)) {
+            resultError = new Error("本轮收到多个成功的应用工具请求，已停止派发。请合并请求后重试。");
+            continue;
+          }
           observedToolCalls.set(event.toolUseId, {
             toolUseId: event.toolUseId,
             toolName: event.toolName,
             input: event.input,
           });
+          if (event.completed) completedToolCalls.add(event.toolUseId);
           continue;
         }
         if (event.type === "tool_end" && event.failed) {
           observedToolCalls.delete(event.toolUseId);
+          completedToolCalls.delete(event.toolUseId);
           continue;
         }
         if (event.type === "result") {
           // Codex 把答案和用量分在两个事件里，这里合并。
-          if (event.answer) observedAnswer = event.answer;
+          if (event.answer || event.final) observedAnswer = event.answer;
           if (event.stats) observedStats = event.stats;
+        }
+        if (event.type === "usage") {
+          // 每次执行独立累计，避免注册表中共享适配器串用两个话题的消耗。
+          for (const key of Object.keys(event.stats) as (keyof CliUsageStats)[]) {
+            const value = event.stats[key];
+            if (value === undefined) {
+              incompleteUsage.add(key);
+              delete stepUsage[key];
+            } else if (!incompleteUsage.has(key)) stepUsage[key] = (stepUsage[key] ?? 0) + value;
+          }
+          observedStats = { ...observedStats, ...stepUsage };
+          for (const key of incompleteUsage) delete observedStats[key];
         }
       }
     });
@@ -328,6 +385,9 @@ function runCliOnce(
         return fail(
           new Error(stderr.trim() || `${adapter.displayName} 退出，状态码 ${code}`),
         );
+      }
+      if (adapter.capabilities?.appToolsReady && !appToolsReady) {
+        return fail(new Error(`${adapter.displayName} 的应用工具未就绪，请检查 MCP 配置与 DSH 版本后重试`));
       }
       if (observedAnswer === undefined) {
         // 状态码正常却没有最终结果，说明协议没有完整走完。

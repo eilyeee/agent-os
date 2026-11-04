@@ -1,9 +1,10 @@
-/** 自建 MCP Server 的工具名，以及把它挂到两种 CLI 上的启动参数。 */
+/** 自建 MCP Server 的工具名，以及把它挂到各 CLI 上的启动参数。 */
 import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { dshRuntimeBridgeSource } from "./dsh-runtime-bridge.js";
 
 export const CLARIFICATION_TOOL_NAME = "request_clarification";
 export const PRODUCT_SPEC_TOOL_NAME = "request_spec_approval";
@@ -20,6 +21,9 @@ export const CLAUDE_APP_TOOL_NAMES: Record<string, string> = {
   [`${CLAUDE_PREFIX}${DISPATCH_TASK_TOOL_NAME}`]: DISPATCH_TASK_TOOL_NAME,
   [`${CLAUDE_PREFIX}${SCHEDULE_MANAGE_TOOL_NAME}`]: SCHEDULE_MANAGE_TOOL_NAME,
 };
+
+/** DSH 与 Claude 使用相同的 MCP 命名空间。 */
+export const DSH_APP_TOOL_NAMES = CLAUDE_APP_TOOL_NAMES;
 
 export const APP_TOOL_NAMES = new Set([
   CLARIFICATION_TOOL_NAME,
@@ -94,4 +98,45 @@ export function codexAppToolArgs(): string[] {
     "-c",
     `mcp_servers.agent_os.args=${JSON.stringify(invocation.args)}`,
   ];
+}
+
+let cachedDshPatchPath: string | undefined;
+
+export function dshAppToolArgs(): string[] {
+  if (!cachedDshPatchPath) {
+    const invocation = serverInvocation();
+    const directory = join(tmpdir(), "agent-os-mcp");
+    mkdirSync(directory, { recursive: true });
+    const bridge = dshRuntimeBridgeSource(Object.keys(DSH_APP_TOOL_NAMES));
+    const bridgePath = join(directory, `dsh-bridge-${createHash("sha256").update(bridge).digest("hex").slice(0, 16)}.mjs`);
+    writeFileSync(bridgePath, bridge, "utf8");
+    // JSON 是 YAML 子集；用文件传 patch，Windows 的 cmd 才不会拆碎引号和路径。
+    const content = JSON.stringify([
+      { id: "sandbox-policy", config: { mode: "workspace-write" } },
+      // headless 没有交互审批通道。never 拒绝需提权的动作，不能把它理解成自动批准。
+      { id: "approval", config: { policy: "never" } },
+      { id: "agent-loop", config: { agents: [] } },
+      // 原生必需入口依赖就绪服务：MCP 或桥接加载失败时，在模型执行前终止启动。
+      { id: "headless-runner", inject: ["headlessStartup", "agentOsBridge"] },
+      // 原生权限服务要求沙箱与审批默认值对应到同一个 preset，否则插件不会激活。
+      { id: "permission", config: {
+        defaultPreset: "agent-os",
+        presets: { "agent-os": { sandbox: "workspace-write", approval: "never" } },
+      } },
+      { insert: [{ id: "agent-os-bridge", name: bridgePath }, {
+        id: "agent-os-mcp",
+        name: "@deepseek-ai/dsh-mcp-client",
+        config: {
+          serverName: "agent_os", transport: "stdio",
+          command: invocation.command, args: invocation.args,
+          failOnStartupError: true,
+        },
+      }] },
+    ]);
+    const path = join(directory,
+      `dsh-${createHash("sha256").update(content).digest("hex").slice(0, 16)}.json`);
+    writeFileSync(path, content, "utf8");
+    cachedDshPatchPath = path;
+  }
+  return ["--patch", cachedDshPatchPath];
 }

@@ -1,6 +1,6 @@
 /** CLI 引擎的统一契约：参数组装、事件翻译、运行结果。cli/ 以上只认这里的类型。 */
 
-export type CliId = "claude" | "codex";
+export type CliId = "claude" | "codex" | "dsh";
 
 export type CliPromptInput = "argument" | "stdin";
 
@@ -23,6 +23,13 @@ export interface CliAdapterCapabilities {
    * 对不能派的引擎拿同一把尺子量，只会得到一片永远的「未验证」。
    */
   subagents: boolean;
+  /** 没有公开原生入口时显式关闭，不能拿普通提示词冒充历史查询或压缩。 */
+  nativeHistory?: boolean;
+  nativeCompact?: boolean;
+  /** 应用工具必须经过原生启动门并发出就绪握手，缺失时不能结算为成功。 */
+  appToolsReady?: boolean;
+  /** 编排每轮只接一个成功应用请求，其他调用必须明确失败，不能静默覆盖。 */
+  singleAppTool?: boolean;
 }
 
 export interface CliRunStats {
@@ -48,13 +55,17 @@ export interface CliRunStats {
 }
 
 export type CliEvent =
+  | { type: "ready" }
   | { type: "session"; sessionId: string }
+  | { type: "subagent"; subagentType: string }
   | {
       type: "tool_start";
       toolUseId: string;
       toolName: string;
       label: string;
       detail?: string;
+      /** 参数指纹只用于重复检测，避免不同调用被相同的简短展示文案合并。 */
+      inputHash?: string;
       /**
        * 这次调用派生了一个子 Agent 的话，是哪一个（tester / code-reviewer / …）。
        * 靠观察拿到，不靠引擎自报——自报可以撒谎，真机上就出现过报告说
@@ -65,12 +76,19 @@ export type CliEvent =
   | { type: "tool_end"; toolUseId: string; failed: boolean }
   | { type: "context"; usedTokens: number }
   /** 应用工具（我们自建的 MCP Server）调用，携带原始参数交给 app/ 处理。 */
-  | { type: "tool_call"; toolUseId: string; toolName: string; input: unknown }
-  | { type: "result"; answer: string; sessionId?: string; stats?: CliRunStats }
+  | { type: "tool_call"; toolUseId: string; toolName: string; input: unknown; completed?: boolean }
+  /** 每步增量，由 Runner 按次运行累加。显式 undefined 表示该计数不完整，不能报总量。 */
+  | { type: "usage"; stats: CliUsageStats }
+  | { type: "result"; answer: string; sessionId?: string; stats?: CliRunStats; final?: boolean }
   | { type: "error"; message: string; sessionId?: string };
+
+export type CliUsageStats = Pick<CliRunStats,
+  "turns" | "totalTokens" | "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheCreationTokens"
+>;
 
 /** 原生上下文整理的执行计划。两种引擎协议不同，由 native-compact 分派。 */
 export type CliCompactPlan =
+  | { protocol: "unsupported"; message: string }
   | {
       protocol: "claude-stream-json";
       command: string;

@@ -27,7 +27,7 @@ export const COMMAND_DOCS: readonly CommandDoc[] = [
     description: "本群这台机器人的开销：累计 tokens、按来源拆分、最贵的几件",
   },
   { usage: "/team", description: "团队名册：职责、引擎、Skill、连接状态" },
-  { usage: "/new", description: "在本话题开启全新 CLI 会话，旧会话仍可恢复" },
+  { usage: "/new", description: "在本话题开启全新 CLI 会话" },
   { usage: "/resume", description: "从当前工作目录里挑一个历史 CLI 会话恢复" },
   { usage: "/compact [要求]", description: "调用引擎原生能力整理当前上下文" },
   { usage: "/cd [目录]", description: "查看或切换本话题的工作目录" },
@@ -38,6 +38,7 @@ export const COMMAND_DOCS: readonly CommandDoc[] = [
   { usage: "/close", description: "停止正在运行的任务并关闭本话题会话" },
   { usage: "/claude <任务>", description: "新话题使用 Claude Code" },
   { usage: "/codex <任务>", description: "新话题使用 Codex" },
+  { usage: "/dsh <任务>", description: "新话题使用 DeepSeek Harness" },
 ];
 
 /** `/help` 在群里回的那几行。 */

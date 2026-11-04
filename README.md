@@ -41,7 +41,7 @@ Agent OS is that layer.
 ```
 
 **It does not call model APIs.** There is no AI SDK dependency. Model calls, tool
-execution and context management stay inside Claude Code and Codex. Agent OS
+execution and context management stay inside Claude Code, Codex and DeepSeek Harness. Agent OS
 commands them — and the engines underneath can be swapped later without losing
 the way of working built on top.
 
@@ -60,7 +60,7 @@ the way of working built on top.
 
 **Solo mode** — command one agent from anywhere
 
-- Ask from a Lark thread, a real Claude Code or Codex process does the work
+- Ask from a Lark thread, a real Claude Code, Codex or DSH process does the work
 - Live task card: current action, tool trail, elapsed time, context usage, cost
 - Stop a running task from the card; only the person who started it can
 - Follow-up questions in the same thread resume the same CLI context
@@ -98,7 +98,7 @@ the way of working built on top.
 |---|---|
 | Runtime | Node.js 22.13+, pnpm 11.5.3 |
 | Chat | A Lark/Feishu **topic group** (not a regular group) and a self-built app per bot |
-| Engines | [Claude Code](https://docs.claude.com/en/docs/claude-code) and/or [Codex CLI](https://github.com/openai/codex), installed and logged in |
+| Engines | [Claude Code](https://docs.claude.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), or [DeepSeek Harness](#deepseek-harness-experimental), installed and configured |
 | OS | macOS, Linux, or Windows via Git Bash / WSL2 |
 
 Install and authenticate your chosen engine under a dedicated operating-system
@@ -198,7 +198,7 @@ nothing to address; the same access checks still apply.
 | `/history` | Tasks this bot ran in this chat, across threads — filter by outcome, page through them |
 | `/cost` | What this bot has spent in this chat: tokens, split by origin, priciest items |
 | `/team` | Team roster: roles, engines, skills, connection state |
-| `/new` | Start a fresh CLI session in this thread; old one stays recoverable |
+| `/new` | Start a fresh CLI session in this thread |
 | `/resume` | Pick a historical CLI session from this working directory |
 | `/compact [note]` | Have the engine natively compress its own context |
 | `/cd [dir]` | Show or change this thread's working directory |
@@ -206,9 +206,25 @@ nothing to address; the same access checks still apply.
 | `/close` | Stop any running task and close this thread's session |
 | `/claude <task>` | Start a new thread on Claude Code |
 | `/codex <task>` | Start a new thread on Codex |
+| `/dsh <task>` | Start a new thread on DeepSeek Harness |
 
 An engine is fixed when a thread is created — switching means opening a new thread,
-because the two CLIs' session ids are not interchangeable.
+because the CLIs' session ids are not interchangeable.
+
+### DeepSeek Harness (experimental)
+
+The adapter targets official `@deepseek-ai/dsh@0.2.1-rc.5`. Use Node.js 24.9+ for DSH and make that `dsh` available on Agent OS's `PATH`. Older DSH versions lack the required JSON stream and persisted-session resume support.
+
+```bash
+npm install -g @deepseek-ai/dsh@0.2.1-rc.5
+dsh --profile headless --help
+```
+
+Configure models and credentials in DSH's user directory (`~/.dsh/.env` by default, or `$DSH_HOME/.env`) following the [official headless documentation](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/bundle/headless/README.md). Keep them out of this repository's `.env` and bot JSON. Send `/dsh <task>` in a new thread, or set `defaultCli` to `"dsh"`.
+
+Supports task execution, automatic continuation in the same thread, tool progress, usage totals, and all five MCP application tools. Agent OS writes a temporary MCP patch and native event bridge without changing DSH's user configuration or adding a model API dependency. All five tools must register before the headless task starts; MCP or bridge startup failures block execution. Application-tool results from child agents and PTC programs reach the same thread; human answers resume the main session. One CLI execution accepts one successful application request; additional concurrent requests receive an explicit error and can be submitted after the current request is handled. DSH runs with `workspace-write` and denies operations requiring interactive escalation; approval in Lark does not bypass that sandbox.
+
+The headless interface currently exposes neither a session list nor native command routing, so the `/resume` picker and manual `/compact` are unavailable. Existing threads continue automatically; DSH owns automatic compaction, and `/new` starts fresh context. Application requests use lossless native final tool results instead of truncated JSONL notifications. Native session bindings survive first-turn failures and cancellation. Verification markers use the actual created child preset identity (`tester` / `code-reviewer`), never free-form descriptions. After configuring DSH, run `pnpm probe:tool dsh /absolute/workspace` in a trusted test workspace to verify MCP end to end.
 
 ---
 
@@ -219,7 +235,7 @@ src/im/     Lark ingress    long connection, event parsing, card construction
 src/core/   kernel          sessions, state machine, persistence, collaboration
 src/cli/    engines         per-CLI arguments and protocol → unified CliEvent
 src/app/    orchestration   how a message flows through the system
-src/mcp/    tools           local MCP server exposing app tools to both CLIs
+src/mcp/    tools           local MCP server exposing app tools to each CLI
 ```
 
 The kernel does not depend on any messaging platform. Engine differences are
