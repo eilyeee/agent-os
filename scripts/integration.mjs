@@ -1332,10 +1332,10 @@ await t("预算用尽就不再自动续跑，但人随时能重新开始", async
   // 而且看起来很健康。真实数据里有一轮跑了 216 分钟才被时长切掉。
   const rt = await makeRuntime();
   const br = rt.botRuntimes.get("developer");
-  br.config = { ...br.config, maxTokensPerTask: 1000, reviewBy: "reviewer" };
+  br.config = { ...br.config, maxTokensPerTask: 100_000, reviewBy: "reviewer" };
   const adapter = createFakeAdapter([
     { type: "session", sessionId: "b1" },
-    { type: "result", answer: "做完了", sessionId: "b1", stats: { totalTokens: 5000 } },
+    { type: "result", answer: "做完了", sessionId: "b1", stats: { totalTokens: 500_000 } },
   ]);
   rt.getAdapter = () => adapter;
   const handle = createMessageHandler({ runtime: rt, config: br.config });
@@ -1343,12 +1343,15 @@ await t("预算用尽就不再自动续跑，但人随时能重新开始", async
   await waitFor(() => rt.taskRecords.size === 1, { label: "第一轮落盘" });
   await new Promise((r) => setTimeout(r, 200));
 
-  // 这一轮自己花了 5000，超过 1000 的上限 → 不该再自动派给 reviewer
+  // 这一轮花了 500k，跨过合法配置下限 100k → 不该再自动派给 reviewer。
   assert.equal(rt.collaborationInbox.size, 0,
     "预算用尽就不该再自动续跑——那正是会失控的地方");
   const replies = outbound(br.bot).all().filter((m) => m.kind === "text");
   assert.ok(replies.some((m) => m.text.includes("上限")),
     "要告诉人为什么停了，以及花了多少");
+  assert.equal(rt.taskRecords.list()[0].status, "failed");
+  assert.match(rt.taskRecords.list()[0].failureReason, /预算/);
+  assert.equal(outbound(br.bot).lastUpdate().header.template, "red");
 
   // 人再说一句就是新的一件事，从零开始计——预算拦的是自动化，不是人
   await handle(userMessage("接着做", { threadId: "omt_budget2" }), br.bot);
@@ -1427,9 +1430,9 @@ await t("同话题里两件事拿到两个任务编号，交接回来的那轮�
   // 而这个编号还印在卡片上写着「任务编号」给用户看。话题不是任务。
   const { rt, handle, br } = await wire();
   await handle(userMessage("第一件事", { threadId: "omt_two" }), br.bot);
-  await waitFor(() => rt.taskRecords.size === 1, { label: "第一件事落盘" });
+  await waitFor(() => rt.taskRecords.size === 1 && idle(rt), { label: "第一件事落盘并释放会话" });
   await handle(userMessage("第二件事", { threadId: "omt_two" }), br.bot);
-  await waitFor(() => rt.taskRecords.size === 2, { label: "第二件事落盘" });
+  await waitFor(() => rt.taskRecords.size === 2 && idle(rt), { label: "第二件事落盘并释放会话" });
 
   const [one, two] = rt.taskRecords.list();
   assert.equal(one.threadId, two.threadId, "前提：两件事确实在同一个话题里");
@@ -1464,9 +1467,8 @@ await t("配了 reviewBy：一轮做完自动把改动交给那台 bot 复查", 
   await waitFor(() => rt.taskRecords.size === 1, { label: "记录落盘" });
   await new Promise((r) => setTimeout(r, 200));
 
-  // 钉的是「交接单真的投出去了」，不是记录状态——
-  // reviewBy 这条路记的是 success（dispatch_task 那条记 forwarded），
-  // 两者语义上是同一类事件却是两个状态，那是另一个问题，不该由这条用例来断。
+  // 自动互审和显式派发都是实际交接，卡片、票据与历史要使用同一结局。
+  assert.equal(rt.taskRecords.list()[0].status, "forwarded");
   assert.equal(rt.collaborationInbox.size, 1, "该给 reviewer 投一张交接单");
   const [record] = rt.taskRecords.list();
   assert.ok(["success", "forwarded"].includes(record.status),
@@ -1587,16 +1589,17 @@ await t("定时标记挂在会话上：续跑的轮次照样认得出自己属�
   ]);
   rt.getAdapter = () => adapter;
   const br = rt.botRuntimes.get("developer");
-  void resumeSession({
+  const resumed = resumeSession({
     runtime: rt, botRuntime: br, sessionId: session.id, taskId: "t-resume",
     replyToMessageId: "om_x", replyInThread: true, ownerOpenId: "ou_owner",
     text: "接着干",
   });
-  await waitFor(() => rt.activeRuns.size === 1, { label: "续跑起来" });
+  await waitFor(() => rt.activeRuns.size === 1 && rt.sessions.get(session.id).cliSessionId === "r1", { label: "续跑引擎已确认接收" });
   const [run] = [...rt.activeRuns.values()];
   assert.equal(run.scheduleId, s.id,
     "续跑那一轮必须仍然带着定时任务标记，否则删除时找不到它");
   run.controller.abort();
+  await resumed;
   await waitFor(() => rt.activeRuns.size === 0, { label: "收尾" });
 });
 
@@ -2667,8 +2670,10 @@ async function wireDsh(events, { ready = true, exitCode = 0 } = {}) {
   const real = getCliAdapter("dsh");
   const adapter = createFakeAdapter([...(ready ? [dshBridge("ready")] : []), ...events], { id: "dsh", capabilities: real.capabilities, exitCode });
   adapter.parseEvents = (line) => real.parseEvents(line);
-  rt.getAdapter = (id) => id === "dsh" ? adapter : getCliAdapter(id);
+  // DSH 用例只能启动假子进程；交接通知没有 /dsh 前缀，也不能落到本机真实引擎。
+  rt.getAdapter = (id) => { assert.equal(id, "dsh"); return adapter; };
   const br = rt.botRuntimes.get("developer");
+  br.config = { ...br.config, defaultCliId: "dsh" };
   return { rt, adapter, br, handle: createMessageHandler({ runtime: rt, config: br.config }), out: outbound(br.bot) };
 }
 await t("/dsh 新话题执行后继续追问：保留引擎、原生会话和任务历史", async () => {
@@ -2918,5 +2923,577 @@ await t("跨重试复用执行标识的两个成功请求不能覆盖成一项",
   assert.equal(resumed, 2);
   assert.equal(second.rt.taskRecords.list()[0].status, "failed");
   assert.match(second.rt.taskRecords.list()[0].failureReason, /多个成功的应用工具请求/);
+});
+await t("交接发卡期间接受停止或关闭，显式派发、自动互审与返回都不得通知队友", async () => {
+  for (const route of ["dispatch", "review", "return"]) for (const action of ["stop", "close"]) {
+    const nativeId = `stop-${route}-${action}`;
+    const { rt, br, handle, out } = await wireDsh([
+      { type: "session", sessionId: nativeId },
+      ...(route === "dispatch" ? [dshBridge("app_tool", { rootSessionId: nativeId, sessionId: nativeId, callId: "dispatch", tool: "mcp__agent_os__dispatch_task", failed: false,
+        input: { toBotId: "reviewer", task: "停止后不能交接" } })] : []),
+      { type: "final", text: "准备交接" },
+    ]);
+    br.config = { ...br.config, defaultCliId: "dsh", ...(route === "review" ? { reviewBy: "reviewer" } : {}) };
+    let release, entered;
+    const gate = new Promise(resolve => { release = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    const reply = br.bot.replyCard.bind(br.bot);
+    br.bot.replyCard = async (...args) => {
+      if (["任务已派发", "结果已返回"].includes(args[1]?.header?.title?.content)) { entered(); await gate; }
+      return reply(...args);
+    };
+    const threadId = `omt_${nativeId}`;
+    const scope = { chatId: "oc_test", threadId };
+    if (route === "return") rt.collaborationInbox.register({ dispatchId: "aabbcc001122", taskId: nativeId, fromBotId: "reviewer", toBotId: "developer",
+      ...scope, round: 1, maxRounds: 3, workspaceDir: process.cwd(), prompt: "处理后返回" });
+    const msg = route === "return" ? botHandoffMessage("aabbcc001122", br.identity.openId, scope) : userMessage("/dsh 准备交接", scope);
+    await handle(msg, br.bot); await started;
+    const { session } = await rt.sessions.resolve(msg, "dsh", "developer", process.cwd());
+    if (action === "stop") {
+      const stopped = await createCardActionHandler({ runtime: rt, config: br.config })(cardAction({ action: "abort_task", sessionId: session.id }));
+      assert.equal(stopped.toast.type, "success");
+    } else {
+      await runCommand(rt, rt.sessions.get(session.id), userMessage("/close", scope), "/close");
+    }
+    assert.equal(rt.activeRuns.get(session.id).controller.signal.aborted, true);
+    release();
+    await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: nativeId });
+    assert.equal(rt.taskRecords.list()[0].status, "cancelled", `${route}/${action}`);
+    assert.equal(rt.collaborationInbox.size, 0);
+    assert.equal(out.of("mention").filter(item => item.target.openId === "ou_reviewer").length, 0);
+    assert.equal(rt.sessions.get(session.id).status, action === "close" ? "closed" : "idle");
+    assert.ok(out.of("update").some(item => JSON.stringify(item.card).includes("交接已取消")), "已发出的交接卡不能残留派发成功文案");
+  }
+});
+await t("交接通知已提交时停止明确提示不能撤回，关闭和删除定时任务也不伪报取消", async () => {
+  const { abortScheduleRuns } = await R("core/task-abort.js");
+  const nativeId = "delivery-committing";
+  const { rt, br, handle, out } = await wireDsh([
+    { type: "session", sessionId: nativeId },
+    dshBridge("app_tool", { rootSessionId: nativeId, sessionId: nativeId, callId: "send", tool: "mcp__agent_os__dispatch_task", failed: false,
+      input: { toBotId: "reviewer", task: "交接结果" } }), { type: "final", text: "交接" },
+  ]);
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; }); const started = new Promise(resolve => { entered = resolve; });
+  const mention = br.bot.replyMention.bind(br.bot);
+  br.bot.replyMention = async (...args) => { entered(); await gate; return mention(...args); };
+  const msg = userMessage("/dsh 交接", { threadId: "omt_committing" });
+  await handle(msg, br.bot); await started;
+  const { session } = await rt.sessions.resolve(msg, "dsh", "developer", process.cwd());
+  const active = rt.activeRuns.get(session.id); active.scheduleId = "schedule-committing";
+  const denied = await createCardActionHandler({ runtime: rt, config: br.config })(cardAction({ action: "abort_task", sessionId: session.id }));
+  assert.equal(denied.toast.type, "info"); assert.match(denied.toast.content, /无法撤回/);
+  assert.equal(abortScheduleRuns(rt.activeRuns, "schedule-committing"), "not_running");
+  assert.equal(active.controller.signal.aborted, false);
+  await runCommand(rt, rt.sessions.get(session.id), userMessage("/close", { threadId: msg.threadId }), "/close");
+  assert.equal(active.controller.signal.aborted, false);
+  assert.match(out.lastText(), /无法撤回/);
+  release(); await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "已提交交接收尾" });
+  assert.equal(rt.taskRecords.list()[0].status, "forwarded");
+  assert.equal(out.of("mention").filter(item => item.target.openId === "ou_reviewer").length, 1);
+  assert.equal(rt.collaborationInbox.size, 1);
+  assert.equal(rt.sessions.get(session.id).status, "closed");
+});
+await t("预算拒派不能显示已交接，主任务与子任务花费共同阻止三条自动续跑路径", async () => {
+  for (const route of ["dispatch", "review", "return"]) {
+    const nativeId = `budget-${route}`;
+    const { rt, br, handle, out } = await wireDsh([
+      { type: "session", sessionId: nativeId },
+      { type: "status", phase: "step_end", usage: { totalTokens: 180_000 } },
+      dshBridge("usage", { rootSessionId: nativeId, sessionId: `${nativeId}-child`, usage: { totalTokens: 120_000 } }),
+      ...(route === "dispatch" ? [dshBridge("app_tool", { rootSessionId: nativeId, sessionId: nativeId, callId: "send", tool: "mcp__agent_os__dispatch_task", failed: false,
+        input: { toBotId: "reviewer", task: "不应继续交接" } })] : []), { type: "final", text: "" },
+    ]);
+    br.config = { ...br.config, defaultCliId: "dsh", maxTokensPerTask: 240_000, ...(route === "review" ? { reviewBy: "reviewer" } : {}) };
+    const scope = { chatId: "oc_test", threadId: `omt_${nativeId}` };
+    if (route === "return") rt.collaborationInbox.register({ dispatchId: "ddeeff001122", taskId: nativeId, fromBotId: "reviewer", toBotId: "developer",
+      ...scope, round: 1, maxRounds: 3, workspaceDir: process.cwd(), prompt: "处理后返回" });
+    await handle(route === "return" ? botHandoffMessage("ddeeff001122", br.identity.openId, scope) : userMessage("/dsh 派活", scope), br.bot);
+    await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: nativeId });
+    const record = rt.taskRecords.list()[0];
+    assert.equal(record.status, "failed", route); assert.match(record.failureReason, /预算/);
+    assert.equal(record.totalTokens, 300_000);
+    assert.equal(rt.collaborationInbox.size, 0);
+    assert.equal(out.of("mention").filter(item => item.target.openId === "ou_reviewer").length, 0);
+    assert.equal(out.lastUpdate().header.template, "red");
+    assert.ok(!JSON.stringify(out.lastUpdate()).includes("已交给团队成员继续"));
+  }
+});
+await t("预算拒派终态提交期间停止明确提示不能撤回，三条交接路径卡片与历史一致", async () => {
+  for (const route of ["dispatch", "review", "return"]) {
+    const nativeId = `budget-final-${route}`;
+    const { rt, br, handle, out } = await wireDsh([
+      { type: "session", sessionId: nativeId }, { type: "status", phase: "step_end", usage: { totalTokens: 300_000 } },
+      ...(route === "dispatch" ? [dshBridge("app_tool", { rootSessionId: nativeId, sessionId: nativeId, callId: "send", tool: "mcp__agent_os__dispatch_task", failed: false,
+        input: { toBotId: "reviewer", task: "预算已耗尽" } })] : []), { type: "final", text: "" },
+    ]);
+    br.config = { ...br.config, maxTokensPerTask: 100_000, ...(route === "review" ? { reviewBy: "reviewer" } : {}) };
+    const stopped = [];
+    const update = br.bot.updateCard.bind(br.bot);
+    br.bot.updateCard = async (id, card) => {
+      if (card.header.template === "red") {
+        const sessionId = [...rt.activeRuns.keys()][0];
+        stopped.push(await createCardActionHandler({ runtime: rt, config: br.config })(cardAction({ action: "abort_task", sessionId })));
+      }
+      return update(id, card);
+    };
+    const scope = { chatId: "oc_test", threadId: `omt_${nativeId}` };
+    if (route === "return") rt.collaborationInbox.register({ dispatchId: "334455aabbcc", taskId: nativeId, fromBotId: "reviewer", toBotId: "developer",
+      ...scope, round: 1, maxRounds: 3, workspaceDir: process.cwd(), prompt: "处理后返回" });
+    await handle(route === "return" ? botHandoffMessage("334455aabbcc", br.identity.openId, scope) : userMessage("/dsh 派活", scope), br.bot);
+    await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: nativeId });
+    assert.equal(stopped.length, 1, "必须实际走到红卡提交窗口");
+    assert.equal(stopped[0].toast.type, "info"); assert.match(stopped[0].toast.content, /无法撤回/);
+    assert.equal(rt.taskRecords.list()[0].status, "failed");
+    assert.equal(out.lastUpdate().header.template, "red");
+    assert.equal(rt.collaborationInbox.size, 0);
+  }
+});
+await t("评论澄清完整写回原评论并可原会话回答，长问题不会在接口上限处丢失", async () => {
+  const { runProductDocumentComment } = await R("app/product-comment-runner.js");
+  const questions = Array.from({ length: 5 }, (_, i) => ({ id: `q${i}`, prompt: `问题${i}：${"需求范围".repeat(60)}`,
+    options: [{ id: "one", label: `${i}选项一${"甲".repeat(80)}` }, { id: "two", label: `${i}选项二${"乙".repeat(80)}` }] }));
+  const { rt, br, adapter, out } = await wireDsh([
+    { type: "session", sessionId: "comment-clarify" },
+    dshBridge("app_tool", { rootSessionId: "comment-clarify", sessionId: "comment-clarify", callId: "ask", tool: "mcp__agent_os__request_clarification", failed: false,
+      input: { title: "评论需要确认", questions } }), { type: "final", text: "" },
+  ]);
+  const { session } = await rt.sessions.resolve(userMessage("评论", { threadId: "omt_comment_clarify" }), "dsh", "developer", process.cwd());
+  await rt.sessions.transition(session.id, "idle"); await rt.sessions.setCliSessionId(session.id, "comment-clarify");
+  const flow = rt.productSpecFlows.create({ taskId: "comment-clarify", topicId: "comment-topic", botId: "developer", sessionId: session.id, ownerOpenId: "ou_owner",
+    request: { title: "方案", summary: "说明", deliveryMode: "lark-doc", documentUrl: "https://example.feishu.cn/docx/CommentClarify" } });
+  const comment = { eventId: "comment-clarify", fileToken: "CommentClarify", fileType: "docx", commentId: "comment", replyId: "", senderOpenId: "ou_owner", mentionedBot: true };
+  await runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment });
+  const replies = out.of("comment"); const text = replies.map(reply => reply.text).join("");
+  assert.ok(replies.length >= 3, "样本必须跨过单条评论 1000 字符的限制");
+  assert.ok(replies.every(reply => reply.text.length <= 1000));
+  for (const question of questions) {
+    assert.ok(text.includes(question.prompt));
+    for (const option of question.options) assert.ok(text.includes(option.label));
+  }
+  assert.match(text, /本条评论中 @我/); assert.ok(!text.includes("已按评论更新"));
+  assert.equal(flow.status, "pending"); assert.equal(out.of("card").length, 0);
+  finishDshOnResume(adapter, "comment-clarify");
+  await runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment: { ...comment, eventId: "answered", replyId: "answer" } });
+  assert.equal(adapter.prompts[1].kind, "resume"); assert.equal(adapter.prompts[1].sessionId, "comment-clarify");
+  assert.match(adapter.prompts[1].prompt, /触发回复 ID：answer/);
+  assert.equal(rt.activeRuns.size, 0); assert.equal(rt.sessions.get(session.id).status, "idle");
+});
+await t("评论里的审批与其他应用请求明确退回原话题，空答案不冒称已更新文档", async () => {
+  const { runProductDocumentComment } = await R("app/product-comment-runner.js");
+  for (const tool of ["request_approval", "request_spec_approval", "dispatch_task", "schedule_manage", "empty"]) {
+    const { rt, br, out } = await wire([
+      ...(tool === "empty" ? [] : [{ type: "tool_call", toolUseId: "comment-tool", toolName: tool, input: tool === "request_approval"
+        ? { title: "删除旧数据", summary: "清理旧记录", impact: "测试库", risk: "high", command: "delete test rows" } : {} }]),
+      { type: "result", answer: "", final: true },
+    ]);
+    const { session } = await seedSession(rt); await rt.sessions.setCliSessionId(session.id, "comment-tools");
+    const flow = rt.productSpecFlows.create({ taskId: tool, topicId: `comment-${tool}`, botId: "developer", sessionId: session.id, ownerOpenId: "ou_owner",
+      request: { title: "方案", summary: "说明", deliveryMode: "lark-doc", documentUrl: "https://example.feishu.cn/docx/CommentTools" } });
+    await runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment: { eventId: tool, fileToken: "CommentTools", fileType: "docx", commentId: "comment", replyId: "", senderOpenId: "ou_owner", mentionedBot: true } });
+    const text = out.of("comment").map(reply => reply.text).join("");
+    assert.ok(!text.includes("已按评论更新"));
+    assert.match(text, tool === "empty" ? /无法确认/ : /原.*话题/);
+    if (tool === "request_approval") { assert.match(text, /不能在评论里批准/); assert.match(text, /删除旧数据/); }
+    assert.equal(flow.status, "pending"); assert.equal(rt.productSpecFlows.get(flow.token), flow);
+    assert.equal(rt.schedules.list().length, 0); assert.equal(rt.collaborationInbox.size, 0);
+    assert.equal(rt.activeRuns.size, 0); assert.equal(rt.sessions.get(session.id).status, "idle");
+  }
+});
+/** 评论回归沿用原方案和原生会话，预算必须归到同一件事。 */
+async function seedCommentContext(rt, session, taskId = "comment-regression") {
+  await rt.sessions.setCliSessionId(session.id, "comment-native");
+  const flow = rt.productSpecFlows.create({ taskId, topicId: `topic-${session.id}`, botId: "developer", sessionId: session.id, ownerOpenId: "ou_owner",
+    request: { title: "评论方案", summary: "说明", deliveryMode: "lark-doc", documentUrl: "https://example.feishu.cn/docx/CommentRegression" } });
+  const comment = { eventId: taskId, fileToken: "CommentRegression", fileType: "docx", commentId: "comment-regression", replyId: "", senderOpenId: "ou_owner", mentionedBot: true };
+  return { flow, comment };
+}
+await t("评论准备与执行期间不可确认方案，结束并复查后可以确认", async () => {
+  const { runProductDocumentComment } = await R("app/product-comment-runner.js");
+  const { rt, br, adapter } = await wire([
+    { type: "session", sessionId: "comment-native", __delayMs: 300 }, { type: "result", answer: "已完成评论修改", stats: { totalTokens: 100_000 } },
+  ]);
+  const { session } = await seedSession(rt);
+  const { flow, comment } = await seedCommentContext(rt, session);
+  const handle = createCardActionHandler({ runtime: rt, config: br.config });
+  const confirm = () => handle(cardAction({ action: "approve_product_spec", flowToken: flow.token }));
+  const running = runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment });
+  assert.equal(rt.sessions.get(session.id).status, "idle", "先覆盖状态未落盘但已经同步占位的窗口");
+  const preparing = await confirm();
+  assert.equal(preparing.toast.type, "warning"); assert.equal(flow.status, "pending"); assert.equal(preparing.card, undefined);
+  await waitFor(() => adapter.prompts.length === 1 && rt.sessions.get(session.id).status === "active", { label: "评论实际执行" });
+  const active = await confirm();
+  assert.equal(active.toast.type, "warning"); assert.equal(flow.status, "pending");
+  await running;
+  assert.equal((await confirm()).toast.type, "success"); assert.equal(flow.status, "approved");
+  await assert.rejects(() => runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment }), /已确认或失效/);
+  assert.equal(adapter.prompts.length, 1);
+});
+await t("产品确认拒绝已关闭或仍在创建的会话，不改写待确认状态", async () => {
+  for (const status of ["closed", "creating"]) {
+    const rt = await makeRuntime(); const br = rt.botRuntimes.get("developer");
+    const { session } = await seedSession(rt, { status });
+    const flow = rt.productSpecFlows.create({ taskId: "invalid-product-session", topicId: session.id, botId: "developer", sessionId: session.id, ownerOpenId: "ou_owner",
+      request: { title: "方案", summary: "说明", deliveryMode: "lark-doc", documentUrl: "https://example.feishu.cn/docx/InvalidSession" } });
+    const result = await createCardActionHandler({ runtime: rt, config: br.config })(cardAction({ action: "approve_product_spec", flowToken: flow.token }));
+    assert.equal(result.toast.type, status === "closed" ? "error" : "warning");
+    assert.equal(flow.status, "pending"); assert.equal(result.card, undefined);
+  }
+});
+await t("普通消息接续澄清发卡失败时保留已确认答案，重试沿用任务并真正送到引擎", async () => {
+  const { topicScopeIdOf } = await R("core/topic-task.js");
+  for (const failMode of ["throw", "missing-id"]) {
+    const { rt, br, adapter, handle, out } = await wire();
+    const { session } = await seedSession(rt);
+    const flow = rt.clarificationFlows.create({ taskId: `clarification-retry-${failMode}`, topicId: topicScopeIdOf(session.chatId, session.threadId),
+      botId: "developer", sessionId: session.id, ownerOpenId: "ou_owner", originalMessageId: "om_original", cardMessageId: "om_old_clarification", replyInThread: true,
+      request: ClarificationRequestSchema.parse({ title: "保留答案", questions: [
+        { id: "first", prompt: "已经回答的问题", options: [{ id: "one", label: "选项一" }, { id: "two", label: "选项二" }] },
+        { id: "second", prompt: "尚待补充的问题", options: [{ id: "one", label: "选项一" }, { id: "two", label: "选项二" }] },
+      ] }) });
+    rt.clarificationFlows.answer(flow.token, "first", "已确认答案必须保留");
+    const reply = br.bot.replyCard.bind(br.bot);
+    br.bot.replyCard = async () => { if (failMode === "throw") throw new Error("固定发卡失败"); return undefined; };
+    await handle(userMessage("先补充一点", { threadId: session.threadId }), br.bot);
+    assert.equal(adapter.prompts.length, 0); assert.equal(rt.taskRecords.size, 0);
+    assert.equal(rt.clarificationFlows.get(flow.token), flow); assert.equal(flow.answers[0].answer, "已确认答案必须保留");
+    assert.ok(!out.of("update").some(row => row.messageId === "om_old_clarification"), "没有接手前旧卡仍应可回答");
+    br.bot.replyCard = reply;
+    await handle(userMessage("补充完整后再试", { threadId: session.threadId }), br.bot);
+    await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "澄清接续重试" });
+    assert.equal(adapter.prompts.length, 1);
+    assert.match(adapter.prompts[0].prompt, /已确认答案必须保留/); assert.match(adapter.prompts[0].prompt, /补充完整后再试/);
+    assert.equal(rt.taskRecords.list()[0].taskId, flow.taskId);
+    assert.equal(rt.clarificationFlows.get(flow.token), undefined);
+    assert.ok(out.of("update").some(row => row.messageId === "om_old_clarification"));
+  }
+});
+await t("旧澄清卡更新同步失败也不阻断已接手的接续轮，不遗留执行中会话", async () => {
+  const { topicScopeIdOf } = await R("core/topic-task.js");
+  const { rt, br, adapter, handle } = await wire();
+  const { session } = await seedSession(rt);
+  const flow = rt.clarificationFlows.create({ taskId: "clarification-display-failure", topicId: topicScopeIdOf(session.chatId, session.threadId), botId: "developer",
+    sessionId: session.id, ownerOpenId: "ou_owner", originalMessageId: "om_original", cardMessageId: "om_old_clarification", replyInThread: true,
+    request: ClarificationRequestSchema.parse({ title: "澄清", questions: [{ id: "scope", prompt: "确认范围", options: [{ id: "one", label: "方案一" }, { id: "two", label: "方案二" }] }] }) });
+  const update = br.bot.updateCard.bind(br.bot);
+  br.bot.updateCard = (id, card) => { if (id === "om_old_clarification") throw new Error("固定同步更新失败"); return update(id, card); };
+  await handle(userMessage("以这个补充为准", { threadId: session.threadId }), br.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "旧卡更新失败后的接续" });
+  assert.equal(adapter.prompts.length, 1); assert.match(adapter.prompts[0].prompt, /以这个补充为准/);
+  assert.equal(rt.taskRecords.list()[0].taskId, flow.taskId); assert.equal(rt.taskRecords.list()[0].status, "success");
+  assert.equal(rt.sessions.get(session.id).status, "idle"); assert.equal(rt.clarificationFlows.get(flow.token), undefined);
+});
+await t("评论成功消耗进入原任务历史和预算，超过合法上限后不能再交接", async () => {
+  const { runProductDocumentComment } = await R("app/product-comment-runner.js");
+  const { sendCollaborationMessage } = await R("app/collaboration-service.js");
+  const { spentOnTask } = await R("core/task-record.js");
+  const { rt, br } = await wire([
+    { type: "tool_start", toolUseId: "edit", toolName: "Edit", label: "修改文档" }, { type: "tool_end", toolUseId: "edit", failed: false },
+    { type: "result", answer: "已修改正文", sessionId: "comment-native", stats: { totalTokens: 300_000 } },
+  ]);
+  const { session } = await seedSession(rt); const { flow, comment } = await seedCommentContext(rt, session);
+  br.config = { ...br.config, maxTokensPerTask: 240_000 };
+  await seedRecord(rt, { taskId: flow.taskId, sessionId: session.id, threadId: session.threadId, status: "waiting", totalTokens: 10_000 });
+  await runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment });
+  assert.equal(rt.taskRecords.size, 2);
+  const record = rt.taskRecords.list().at(-1);
+  assert.equal(record.taskId, flow.taskId); assert.equal(record.origin, "resume"); assert.equal(record.status, "success");
+  assert.equal(record.totalTokens, 300_000); assert.equal(record.toolCount, 1); assert.equal(record.completedToolCount, 1);
+  assert.equal(record.cliSessionId, "comment-native"); assert.equal(record.cardMessageId, undefined);
+  assert.equal(spentOnTask(rt.taskRecords.list(), flow.taskId), 310_000);
+  const sent = await sendCollaborationMessage({ runtime: rt, sender: br, replyToMessageId: "om_budget", targetBotId: "reviewer", taskId: flow.taskId,
+    chatId: session.chatId, threadId: session.threadId, workspaceDir: session.workspaceDir, kind: "forward", round: 1, maxRounds: 2, prompt: "预算耗尽不可继续" });
+  assert.equal(sent, false); assert.equal(rt.collaborationInbox.size, 0);
+  assert.equal(outbound(br.bot).of("mention").filter(row => row.target.openId === "ou_reviewer").length, 0);
+});
+await t("评论澄清、失败和取消都记录同件事的真实结局与已知消耗", async () => {
+  const { runProductDocumentComment } = await R("app/product-comment-runner.js");
+  const { requestTaskAbort } = await R("core/task-abort.js");
+  for (const mode of ["waiting", "failed", "cancelled"]) {
+    const events = [
+      { type: "session", sessionId: "comment-native" },
+      { type: "usage", stats: { totalTokens: 300_000 }, ...(mode === "cancelled" ? { __delayMs: 1000 } : {}) },
+      ...(mode === "waiting" ? [{ type: "tool_call", toolUseId: "clarify", toolName: "request_clarification", input: { title: "评论需要确认", questions: [{ id: "scope", prompt: "确认范围？", options: [{ id: "one", label: "方案一" }, { id: "two", label: "方案二" }] }] } }] : []),
+      ...(mode === "failed" ? [{ type: "error", message: "固定评论失败" }] : [{ type: "result", answer: "", final: true }]),
+    ];
+    const { rt, br, adapter } = await wire(events, { adapterOptions: { exitCode: mode === "failed" ? 1 : 0 } });
+    const { session } = await seedSession(rt); const { flow, comment } = await seedCommentContext(rt, session, `comment-${mode}`);
+    let usageSeen = false; const parse = adapter.parseEvents.bind(adapter);
+    adapter.parseEvents = line => { const events = parse(line); if (events.some(event => event.type === "usage")) usageSeen = true; return events; };
+    const running = runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment });
+    const settled = running.then(() => undefined, error => error);
+    if (mode === "cancelled") { await waitFor(() => usageSeen, { label: "评论已报告用量" }); assert.equal(requestTaskAbort(rt.activeRuns, session.id, "ou_owner"), "stopped"); }
+    const error = await settled;
+    if (mode !== "waiting") assert.match(error?.message, mode === "cancelled" ? /取消/ : /固定评论失败/);
+    const record = rt.taskRecords.list()[0];
+    assert.equal(record.status, mode); assert.equal(record.taskId, flow.taskId); assert.equal(record.origin, "resume");
+    assert.equal(record.totalTokens, 300_000);
+    if (mode === "waiting") assert.match(record.answer, /确认范围/);
+    assert.equal(rt.sessions.get(session.id).status, "idle"); assert.equal(rt.activeRuns.size, 0);
+  }
+});
+await t("普通任务失败与取消仍保留 DSH 主任务和子任务已报告的消耗，不能派发失败缓存", async () => {
+  for (const mode of ["failed", "cancelled"]) {
+    const { rt, br, handle, adapter, out } = await wireDsh([
+      { type: "session", sessionId: "terminal-cost" },
+      { type: "status", phase: "step_end", usage: { totalTokens: 180_000 } },
+      dshBridge("app_tool", { rootSessionId: "terminal-cost", sessionId: "cost-child", callId: "send", tool: "mcp__agent_os__dispatch_task", failed: false, input: { toBotId: "reviewer", task: "不可派发" } }),
+      { ...dshBridge("usage", { rootSessionId: "terminal-cost", sessionId: "cost-child", usage: { totalTokens: 120_000 } }), ...(mode === "cancelled" ? { __delayMs: 1000 } : {}) },
+      ...(mode === "failed" ? [{ type: "error", message: "固定任务失败" }] : [{ type: "final", text: "不应完成" }]),
+    ], { exitCode: mode === "failed" ? 1 : 0 });
+    let usageSeen = false; const parse = adapter.parseEvents.bind(adapter);
+    adapter.parseEvents = line => { const events = parse(line); if (events.some(event => event.type === "usage" && event.stats.totalTokens === 120_000)) usageSeen = true; return events; };
+    const msg = userMessage("/dsh 检查失败成本", { threadId: `omt_terminal_cost_${mode}` });
+    await handle(msg, br.bot);
+    if (mode === "cancelled") {
+      await waitFor(() => usageSeen, { label: "子任务用量已报告" });
+      const { session } = await rt.sessions.resolve(msg, "dsh", "developer", process.cwd());
+      const response = await createCardActionHandler({ runtime: rt, config: br.config })(cardAction({ action: "abort_task", sessionId: session.id }));
+      assert.equal(response.toast.type, "success");
+    }
+    await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: `任务成本${mode}` });
+    assert.equal(rt.taskRecords.list()[0].status, mode); assert.equal(rt.taskRecords.list()[0].totalTokens, 300_000);
+    assert.equal(rt.taskRecords.list()[0].cliSessionId, "terminal-cost");
+    assert.equal(rt.collaborationInbox.size, 0); assert.equal(out.of("mention").filter(row => row.target.openId === "ou_reviewer").length, 0);
+  }
+});
+await t("评论历史写入失败不改变执行结果，评论发送失败也保留消耗并释放占位", async () => {
+  const { runProductDocumentComment } = await R("app/product-comment-runner.js");
+  for (const failedLayer of ["history", "comment"]) {
+    const { rt, br } = await wire([{ type: "result", answer: "已修改正文", stats: { totalTokens: 300_000 } }]);
+    const { session } = await seedSession(rt); const { flow, comment } = await seedCommentContext(rt, session);
+    if (failedLayer === "history") rt.taskRecords.append = async () => { throw new Error("固定历史写失败"); };
+    else br.bot.replyToDocumentComment = async () => { throw new Error("固定评论发送失败"); };
+    const result = await runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment }).then(() => undefined, error => error);
+    if (failedLayer === "history") { assert.equal(result, undefined); assert.equal(outbound(br.bot).of("comment").length, 1); }
+    else { assert.match(result?.message, /评论发送失败/); assert.equal(rt.taskRecords.list()[0].totalTokens, 300_000); assert.equal(rt.taskRecords.list()[0].status, "success"); }
+    assert.equal(rt.activeRuns.size, 0); assert.equal(rt.sessions.get(session.id).status, "idle");
+  }
+});
+await t("普通任务与评论都在成本落盘后释放会话，写入等待期间不能启动第二轮", async () => {
+  const { runProductDocumentComment } = await R("app/product-comment-runner.js");
+  for (const entry of ["thread", "comment"]) {
+    const { rt, br, adapter, handle, out } = await wire([{ type: "result", answer: "已完成", stats: { totalTokens: 300_000 } }]);
+    const { session } = await seedSession(rt);
+    const { flow, comment } = await seedCommentContext(rt, session);
+    let release, entered;
+    const gate = new Promise(resolve => { release = resolve; }); const writing = new Promise(resolve => { entered = resolve; });
+    const append = rt.taskRecords.append.bind(rt.taskRecords);
+    rt.taskRecords.append = async (...args) => { entered(); await gate; return append(...args); };
+    const running = entry === "thread"
+      ? handle(userMessage("普通任务", { threadId: session.threadId }), br.bot)
+      : runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment });
+    await writing;
+    assert.equal(rt.activeRuns.has(session.id), true, entry);
+    assert.equal(rt.sessions.get(session.id).status, "active");
+    await handle(userMessage("不能在成本写完之前启动", { threadId: session.threadId }), br.bot);
+    assert.equal(adapter.prompts.length, 1);
+    assert.match(out.lastText(), /执行|收尾/);
+    release(); await running;
+    await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: `${entry}成本落盘后释放` });
+    assert.equal(rt.taskRecords.list()[0].totalTokens, 300_000);
+    assert.equal(rt.sessions.get(session.id).status, "idle");
+  }
+});
+await t("显式派活遵守交接轮次上限，首次允许、到达上限后不再产生通知或票据", async () => {
+  const rt = await makeRuntime();
+  const developer = rt.botRuntimes.get("developer"), reviewer = rt.botRuntimes.get("reviewer");
+  for (const br of [developer, reviewer]) br.config = { ...br.config, collaborationMaxRounds: 1, maxTokensPerTask: 5_000_000 };
+  const adapters = new Map([["claude", createFakeAdapter([{ type: "tool_call", toolUseId: "forward", toolName: "dispatch_task", input: { toBotId: "reviewer", task: "审查" } }, { type: "result", answer: "交接", stats: { totalTokens: 1000 } }])],
+    ["codex", createFakeAdapter([{ type: "tool_call", toolUseId: "return", toolName: "dispatch_task", input: { toBotId: "developer", task: "不能越过上限" } }, { type: "result", answer: "交接", stats: { totalTokens: 1000 } }], { id: "codex" })]]);
+  rt.getAdapter = id => { assert.ok(adapters.has(id)); return adapters.get(id); };
+  const scope = { chatId: "oc_test", threadId: "omt_round_boundary" };
+  await createMessageHandler({ runtime: rt, config: developer.config })(userMessage("开始一件事", scope), developer.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "首次派活" });
+  assert.equal(rt.taskRecords.list()[0].status, "forwarded");
+  const notice = outbound(developer.bot).of("mention").find(row => row.target.openId === reviewer.identity.openId);
+  const dispatchId = notice.text.match(/任务编号：([a-f0-9]{12})/)[1];
+  const ticket = rt.collaborationInbox.consume(dispatchId, "reviewer", scope);
+  assert.equal(ticket.round, 1); assert.equal(ticket.maxRounds, 1); rt.collaborationInbox.register(ticket);
+  await createMessageHandler({ runtime: rt, config: reviewer.config })(botHandoffMessage(dispatchId, reviewer.identity.openId, scope), reviewer.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 2, { label: "已到上限的显式派活" });
+  const record = rt.taskRecords.list().at(-1);
+  assert.equal(record.status, "failed"); assert.match(record.failureReason, /轮次上限/);
+  assert.equal(rt.collaborationInbox.size, 0);
+  assert.equal(outbound(reviewer.bot).of("mention").filter(row => row.target.openId === developer.identity.openId && row.text.includes("任务编号：")).length, 0);
+  assert.equal(outbound(reviewer.bot).lastUpdate().header.template, "red");
+});
+await t("公共交接出口拒绝越界和非法轮次，拒绝前不发送任何卡片或通知", async () => {
+  const { sendCollaborationMessage } = await R("app/collaboration-service.js");
+  const { rt, br, out } = await wire();
+  const request = { runtime: rt, sender: br, targetBotId: "reviewer", replyToMessageId: "om_round", chatId: "oc_test", threadId: "omt_round", taskId: "round-task", kind: "forward", workspaceDir: process.cwd(), prompt: "检查" };
+  for (const [round, maxRounds] of [[2, 1], [0, 1], [-1, 1], [1.5, 2], [1, 0], [NaN, 2], [1, Infinity]]) {
+    await assert.rejects(() => sendCollaborationMessage({ ...request, round, maxRounds }), /轮次/);
+    assert.equal(rt.collaborationInbox.size, 0); assert.equal(out.all().length, 0);
+  }
+  assert.equal(await sendCollaborationMessage({ ...request, round: 1, maxRounds: 1 }), true);
+  assert.equal(rt.collaborationInbox.size, 1);
+});
+await t("真实命令并发中失败的 cd 不污染 new，磁盘与成功回复均保留原目录", async () => {
+  const { rmSync } = await import("node:fs");
+  const { rt, br } = await wire(); const { session, msg } = await seedSession(rt);
+  const bound = await rt.sessions.setCliSessionId(session.id, "original-context");
+  const destination = join(dir, `other-project-${n}`); mkdirSync(destination);
+  const store = rt.sessions.store, file = store.filePath, save = store.save.bind(store);
+  let release, entered; const gate = new Promise(resolve => { release = resolve; }); const saving = new Promise(resolve => { entered = resolve; }); let first = true;
+  store.save = async rows => {
+    if (!first) return save(rows);
+    first = false; entered(); await gate;
+    try { return await save(rows); } catch (error) { rmSync(`${file}.tmp`, { recursive: true }); throw error; }
+  };
+  mkdirSync(`${file}.tmp`);
+  const changing = runCommand(rt, bound, msg, `/cd ${destination}`); await saving;
+  const resetting = runCommand(rt, rt.sessions.get(session.id), msg, "/new"); release();
+  await Promise.all([changing, resetting]);
+  const current = rt.sessions.get(session.id), disk = JSON.parse(readFileSync(file, "utf8")).find(row => row.id === session.id);
+  assert.equal(current.workspaceDir, process.cwd()); assert.equal(disk.workspaceDir, process.cwd());
+  assert.equal(current.cliSessionId, undefined); assert.equal(disk.cliSessionId, undefined);
+  assert.match(outbound(br.bot).lastText(), /无法切换工作目录/); assert.ok(outbound(br.bot).contains("新会话已就绪"));
+});
+await t("准备消息期间提交 cd 或 new 后，旧快照不能启动旧目录或旧原生会话", async () => {
+  for (const operation of ["cd", "new"]) {
+    const { rt, br, adapter, handle, out } = await wire(); const { session, msg } = await seedSession(rt);
+    await rt.sessions.setCliSessionId(session.id, "old-context");
+    let release, entered; const gate = new Promise(resolve => { release = resolve; }); const resolving = new Promise(resolve => { entered = resolve; });
+    br.bot.resolveUserName = async () => { entered(); await gate; return "发起人"; };
+    const preparing = handle(userMessage("等待期间不能使用旧绑定", { threadId: session.threadId }), br.bot); await resolving;
+    const destination = join(dir, `prepared-${operation}-${n}`); mkdirSync(destination);
+    await runCommand(rt, rt.sessions.get(session.id), msg, operation === "cd" ? `/cd ${destination}` : "/new");
+    assert.equal(rt.sessions.isUpdating(session.id), false, "覆盖的是更新已经提交、pending标记也已清除的窗口");
+    release(); await preparing;
+    assert.equal(adapter.prompts.length, 0); assert.equal(rt.taskRecords.size, 0);
+    assert.ok(out.of("card").some(row => JSON.stringify(row.card).includes("绑定已经更新")));
+    await handle(userMessage("现在用新绑定重试", { threadId: session.threadId }), br.bot);
+    await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "新绑定执行" });
+    assert.equal(adapter.prompts.length, 1); assert.equal(adapter.prompts[0].kind, "new");
+    assert.equal(rt.taskRecords.list()[0].workspaceDir, realpathSync(operation === "cd" ? destination : process.cwd()));
+  }
+});
+await t("绑定写盘未完成时直接续跑与评论不能读取旧绑定，提交后可恢复", async () => {
+  const { resumeSession } = await R("app/task-runner.js");
+  const { runProductDocumentComment } = await R("app/product-comment-runner.js");
+  const { rt, br, adapter } = await wire(); const { session } = await seedSession(rt); const { flow, comment } = await seedCommentContext(rt, session);
+  const store = rt.sessions.store, save = store.save.bind(store); let release, entered;
+  const gate = new Promise(resolve => { release = resolve; }); const saving = new Promise(resolve => { entered = resolve; }); let first = true;
+  store.save = async rows => { if (first) { first = false; entered(); await gate; } return save(rows); };
+  const updating = rt.sessions.setCliSessionId(session.id, "new-binding"); await saving;
+  await assert.rejects(() => resumeSession({ runtime: rt, botRuntime: br, sessionId: session.id, taskId: flow.taskId, ownerOpenId: "ou_owner", replyToMessageId: "om_resume", replyInThread: true, text: "继续" }), /保存更新/);
+  await assert.rejects(() => runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment }), /仍在执行/);
+  assert.equal(adapter.prompts.length, 0); assert.equal(rt.activeRuns.size, 0);
+  release(); await updating;
+  await runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment });
+  assert.equal(adapter.prompts.length, 1); assert.equal(adapter.prompts[0].sessionId, "new-binding");
+});
+await t("产品确认写盘失败有明确错误且状态保持待确认，恢复后重试真正写入", async () => {
+  const { rmSync } = await import("node:fs"); const { JsonProductSpecFlowStore } = await R("core/product-spec-store.js");
+  const { rt, br } = await wire(); const { session } = await seedSession(rt);
+  const file = join(dir, `product-confirm-${n}.json`); rt.productSpecFlows = new JsonProductSpecFlowStore(file);
+  const { flow } = await seedCommentContext(rt, session);
+  const confirm = () => createCardActionHandler({ runtime: rt, config: br.config })(cardAction({ action: "approve_product_spec", flowToken: flow.token }));
+  mkdirSync(`${file}.tmp`); const failed = await confirm();
+  assert.equal(failed.toast.type, "error"); assert.match(failed.toast.content, /未能保存.*重试/); assert.equal(failed.card, undefined);
+  assert.equal(flow.status, "pending"); assert.equal(JSON.parse(readFileSync(file, "utf8"))[0].status, "pending");
+  rmSync(`${file}.tmp`, { recursive: true }); const retried = await confirm();
+  assert.equal(retried.toast.type, "success"); assert.equal(flow.status, "approved");
+  assert.equal(new JsonProductSpecFlowStore(file).get(flow.token).status, "approved");
+});
+await t("卡片续跑未获原生执行确认时保留澄清与审批，缺标识、spawn失败和无确认错误都可重试", async () => {
+  const { topicScopeIdOf } = await R("core/topic-task.js");
+  for (const kind of ["clarification", "approval"]) for (const failure of ["missing-id", "spawn", "no-ack"]) {
+    const { rt, br, adapter, handle, out } = await wire(failure === "no-ack" ? [{ type: "error", message: "固定启动失败" }] : DONE, { adapterOptions: { exitCode: failure === "no-ack" ? 1 : 0 } });
+    const { session, msg } = await seedSession(rt); await rt.sessions.setCliSessionId(session.id, "original-context");
+    const reply = br.bot.replyCard.bind(br.bot);
+    if (failure === "missing-id") br.bot.replyCard = async () => undefined;
+    if (failure === "spawn") adapter.command = join(dir, "cli-that-does-not-exist");
+    let flow, action;
+    if (kind === "clarification") {
+      flow = rt.clarificationFlows.create({ taskId: `decision-${failure}`, topicId: topicScopeIdOf(session.chatId, session.threadId), botId: "developer", sessionId: session.id, ownerOpenId: "ou_owner",
+        originalMessageId: msg.messageId, cardMessageId: "om_decision", replyInThread: true,
+        request: ClarificationRequestSchema.parse({ title: "需要确认", questions: [{ id: "scope", prompt: "选择范围", options: [{ id: "one", label: "确认答案必须保留" }, { id: "two", label: "其他" }] }] }) });
+      action = { action: "answer_clarification", flowToken: flow.token, questionId: "scope", optionId: "one" };
+    } else {
+      flow = rt.approvalFlows.create({ taskId: `decision-${failure}`, botId: "developer", sessionId: session.id, ownerOpenId: "ou_owner", originalMessageId: msg.messageId, cardMessageId: "om_decision", replyInThread: true,
+        request: { title: "测试审批", summary: "操作说明", impact: "测试目录", risk: "high" } });
+      action = { action: "decide_approval", flowToken: flow.token, decision: "approved" };
+    }
+    await createCardActionHandler({ runtime: rt, config: br.config })(cardAction(action));
+    await waitFor(() => idle(rt) && (kind === "clarification" ? out.of("update").some(row => JSON.stringify(row.card).includes("未能继续")) : out.of("text").some(row => row.text.includes("审批结论暂时没能送达"))), { label: `${kind}/${failure}退回重试` });
+    const failedRecords = rt.taskRecords.size;
+    assert.equal(failedRecords, failure === "missing-id" ? 0 : 1);
+    assert.equal(kind === "clarification" ? rt.clarificationFlows.get(flow.token) : rt.approvalFlows.get(flow.token), flow);
+    if (kind === "clarification") assert.equal(flow.answers[0].answer, "确认答案必须保留");
+    else assert.equal(flow.status, "pending");
+    const good = createFakeAdapter([{ type: "session", sessionId: "decision-retry" }, { type: "result", answer: "继续完成" }]);
+    adapter.command = process.execPath; adapter.buildArgs = good.buildArgs.bind(good); adapter.buildResumeArgs = good.buildResumeArgs.bind(good); br.bot.replyCard = reply;
+    if (kind === "clarification") await handle(userMessage("继续执行", { threadId: session.threadId }), br.bot);
+    else await createCardActionHandler({ runtime: rt, config: br.config })(cardAction(action));
+    await waitFor(() => idle(rt) && rt.taskRecords.size === failedRecords + 1 && !(kind === "clarification" ? rt.clarificationFlows.get(flow.token) : rt.approvalFlows.get(flow.token)), { label: `${kind}/${failure}成功重试` });
+    assert.equal(good.prompts.length, 1); assert.equal(rt.taskRecords.list().at(-1).taskId, flow.taskId);
+    if (kind === "clarification") assert.match(good.prompts[0].prompt, /确认答案必须保留/);
+  }
+});
+await t("自然文字接续澄清在 spawn 失败时不烧掉原问题与已确认答案", async () => {
+  const { topicScopeIdOf } = await R("core/topic-task.js");
+  const { rt, br, adapter, handle, out } = await wire(); const { session } = await seedSession(rt);
+  const flow = rt.clarificationFlows.create({ taskId: "natural-spawn-failure", topicId: topicScopeIdOf(session.chatId, session.threadId), botId: "developer", sessionId: session.id,
+    ownerOpenId: "ou_owner", originalMessageId: "om_original", cardMessageId: "om_old_flow", replyInThread: true,
+    request: ClarificationRequestSchema.parse({ title: "澄清", questions: [
+      { id: "first", prompt: "已答问题", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] },
+      { id: "second", prompt: "待答问题", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] },
+    ] }) });
+  rt.clarificationFlows.answer(flow.token, "first", "此前已确认答案"); adapter.command = join(dir, "missing-natural-cli");
+  await handle(userMessage("选择A", { threadId: session.threadId }), br.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: "自然回答启动失败" });
+  assert.equal(rt.clarificationFlows.get(flow.token), flow); assert.equal(flow.answers[0].answer, "此前已确认答案");
+  assert.ok(!out.of("update").some(row => row.messageId === "om_old_flow"));
+  adapter.command = process.execPath;
+  await handle(userMessage("选择A，重试", { threadId: session.threadId }), br.bot);
+  await waitFor(() => idle(rt) && rt.taskRecords.size === 2, { label: "自然回答恢复执行" });
+  assert.equal(rt.clarificationFlows.get(flow.token), undefined); assert.match(adapter.prompts.at(-1).prompt, /此前已确认答案/);
+  assert.equal(rt.taskRecords.list().at(-1).taskId, flow.taskId);
+});
+await t("Claude 和 Codex 原生成功工具回执跨529保留待办，失败和仅开始的请求不冒充成功", async () => {
+  const { topicScopeIdOf } = await R("core/topic-task.js");
+  for (const id of ["claude", "codex"]) for (const outcome of ["success", "failed", "started-only"]) {
+    const real = getCliAdapter(id); const rt = await makeRuntime(); const br = rt.botRuntimes.get("developer"); br.config = { ...br.config, defaultCliId: id };
+    const input = { title: "不能丢失的原生问题", questions: [{ id: "scope", prompt: "请确认范围", options: [{ id: "one", label: "本地" }, { id: "two", label: "同步" }] }] };
+    const usage = { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+    const first = id === "claude" ? [
+      { type: "system", subtype: "init", session_id: "native-confirmed" },
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "ask", name: "mcp__agent_os__request_clarification", input }] } },
+      ...(outcome === "started-only" ? [] : [{ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "ask", is_error: outcome === "failed", content: "工具回执" }] } }]),
+      { type: "result", is_error: true, result: "API Error: 529 Overloaded", usage },
+    ] : [
+      { type: "thread.started", thread_id: "native-confirmed" },
+      { type: "item.started", item: { id: "ask", type: "mcp_tool_call", server: "agent_os", tool: "request_clarification", arguments: input } },
+      ...(outcome === "started-only" ? [] : [{ type: "item.completed", item: { id: "ask", type: "mcp_tool_call", server: "agent_os", tool: "request_clarification", arguments: input, status: outcome === "failed" ? "failed" : "completed" } }]),
+      { type: "turn.failed", error: { message: "API Error: 529 Overloaded" }, usage },
+    ];
+    const last = id === "claude" ? [{ type: "result", result: "恢复完成", usage }] : [{ type: "item.completed", item: { id: "answer", type: "agent_message", text: "恢复完成" } }, { type: "turn.completed", usage }];
+    const adapter = createFakeAdapter(first, { id, capabilities: real.capabilities, exitCode: 1 }); const resumed = createFakeAdapter(last, { id, capabilities: real.capabilities });
+    adapter.parseEvents = line => real.parseEvents(line); adapter.buildResumeArgs = resumed.buildResumeArgs.bind(resumed);
+    rt.getAdapter = requested => { assert.equal(requested, id); return adapter; };
+    const scope = { chatId: "oc_test", threadId: `omt_native_${id}_${outcome}` };
+    await withFastCliRetry(async () => {
+      await createMessageHandler({ runtime: rt, config: br.config })(userMessage(`/${id} 检查回执`, scope), br.bot);
+      await waitFor(() => idle(rt) && rt.taskRecords.size === 1, { label: `${id}/${outcome}重试待办` });
+    });
+    const record = rt.taskRecords.list()[0], flow = rt.clarificationFlows.findForTopic(topicScopeIdOf(scope.chatId, scope.threadId), "developer");
+    assert.equal(record.status, outcome === "success" ? "waiting" : "success"); assert.equal(record.retries, 1); assert.equal(resumed.prompts[0].sessionId, "native-confirmed");
+    if (outcome === "success") { assert.ok(flow); assert.equal(flow.request.title, input.title); assert.match(JSON.stringify(outbound(br.bot).lastUpdate()), /请确认范围/); }
+    else assert.equal(flow, undefined);
+  }
+});
+await t("空闲状态尚在落盘时普通任务与评论都保留运行占位，提交后才允许下一轮", async () => {
+  const { runProductDocumentComment } = await R("app/product-comment-runner.js");
+  for (const entry of ["thread", "comment"]) {
+    const { rt, br, handle } = await wire(); const { session } = await seedSession(rt); const { flow, comment } = await seedCommentContext(rt, session);
+    const transition = rt.sessions.transition.bind(rt.sessions); let release, entered;
+    const gate = new Promise(resolve => { release = resolve; }); const saving = new Promise(resolve => { entered = resolve; });
+    rt.sessions.transition = async (id, next) => { if (id === session.id && next === "idle") { entered(); await gate; } return transition(id, next); };
+    const running = entry === "thread" ? handle(userMessage("正常执行", { threadId: session.threadId }), br.bot) : runProductDocumentComment({ runtime: rt, bot: br.bot, flow, comment });
+    await saving; assert.equal(rt.sessions.get(session.id).status, "active"); assert.equal(rt.activeRuns.has(session.id), true, entry);
+    release(); await running; await waitFor(() => idle(rt), { label: `${entry}空闲状态提交` }); assert.equal(rt.sessions.get(session.id).status, "idle");
+  }
 });
 console.log(`\n${pass} passed`);

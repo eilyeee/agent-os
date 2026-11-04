@@ -6,6 +6,12 @@
 import { z } from "zod";
 import type { ToolCallLike } from "./clarification.js";
 
+/** 显式派活与自动返回共用轮次上限，不能由某个调用入口自行决定是否检查。 */
+export const CollaborationRoundSchema = z.object({
+  round: z.number().int().positive(),
+  maxRounds: z.number().int().positive(),
+}).refine(({ round, maxRounds }) => round <= maxRounds);
+
 export interface CollaborationMessage {
   /** 本次投递的取件码，出现在 @消息文本里。 */
   dispatchId: string;

@@ -1,4 +1,4 @@
-/** 生成 DSH 原生插件：应用工具就绪门、任务树校验和无损工具结果通道。 */
+/** 生成 DSH 原生插件：应用工具就绪门、任务树校验、无损工具结果与子任务用量。 */
 export function dshRuntimeBridgeSource(toolNames: readonly string[]): string {
   // 插件由 DSH 的 Node 加载；绝对模块 URL 同时适用于 tsx 开发与构建后的安装目录。
   return `import { z } from ${JSON.stringify(import.meta.resolve("zod"))};\n`
@@ -25,6 +25,12 @@ const Agent = z.custom(value => AgentShape.safeParse(value).success);
 const Created = z.object({ agent: Agent });
 const Execution = z.object({ callId: Id, name: z.string(), arguments: z.unknown(), agent: Agent, token: z.symbol() });
 const Outcome = z.object({ isError: z.boolean() });
+const Count = z.number().int().nonnegative();
+const Usage = z.object({ inputTokens: Count.optional(), outputTokens: Count.optional(), totalTokens: Count.optional(),
+  cacheReadTokens: Count.optional(), cacheWriteTokens: Count.optional() });
+const Settlement = z.object({ type: z.enum(["assistant/message", "assistant/attempt"]), seq: Count,
+  data: z.object({ usage: z.unknown().optional(), stream: z.array(z.unknown()).optional() }) });
+const UsageChunk = z.object({ type: z.literal("chunk"), chunk: z.object({ type: z.literal("usage"), usage: z.unknown() }) });
 
 export function apply(ctx) {
   let root;
@@ -32,6 +38,7 @@ export function apply(ctx) {
   let pending;
   const executionIds = new Map();
   const owned = new Map();
+  const usageSeen = new WeakMap();
   const emit = payload => process.stdout.write(JSON.stringify({ type: "agent_os.bridge", version: 1, ...payload }) + "\n");
   const belongs = agent => root && ctx.agents.get(root.id) === root && owned.get(agent.id) === agent && ctx.agents.get(agent.id) === agent;
   const available = scope => {
@@ -72,6 +79,25 @@ export function apply(ctx) {
   ctx.on("agent/disposed", payload => {
     const parsed = Created.safeParse(payload);
     if (parsed.success && owned.get(parsed.data.agent.id) === parsed.data.agent) owned.delete(parsed.data.agent.id);
+  });
+  ctx.on("session/event", (session, event) => {
+    // headless JSONL 只投影根会话；仅补本次任务后代的原生结算，不能把根的用量再加一次。
+    const agent = [...owned.values()].find(agent => agent !== root && agent.session === session && belongs(agent));
+    if (!agent) return;
+    const parsed = Settlement.safeParse(event);
+    if (!parsed.success) return;
+    const settled = parsed.data;
+    let seen = usageSeen.get(session);
+    if (!seen) usageSeen.set(session, seen = new Set());
+    // 同一原生结算若重复通知，只能计费一次；不同重试的 seq 则分别累计。
+    if (seen.has(settled.seq)) return;
+    seen.add(settled.seq);
+    const chunks = (settled.data.stream ?? []).map(value => UsageChunk.safeParse(value));
+    const sample = settled.type === "assistant/message" && settled.data.usage !== undefined
+      ? settled.data.usage : chunks.findLast(chunk => chunk.success)?.data.chunk.usage;
+    const usage = Usage.safeParse(sample);
+    // 原生 assistant/attempt 包含重试花费；没有采样也要上报缺失，不能冒充完整总量。
+    emit({ kind: "usage", rootSessionId: root.id, sessionId: agent.id, ...(usage.success ? { usage: usage.data } : {}) });
   });
 
   ctx.tools.guard(exec => {

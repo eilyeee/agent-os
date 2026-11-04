@@ -334,20 +334,6 @@ export function createMessageHandler(options: {
       );
     }
 
-    if (pendingClarification) {
-      runtime.clarificationFlows.delete(pendingClarification.token);
-      if (pendingClarification.cardMessageId) {
-        await bot
-          .updateCard(
-            pendingClarification.cardMessageId,
-            buildClarificationSupersededCard(pendingClarification),
-          )
-          .catch((error) =>
-            console.warn("[澄清] 旧卡片更新失败:", (error as Error).message),
-          );
-      }
-    }
-
     await downloadMessageResources(
       botRuntime,
       msg.messageId,
@@ -423,6 +409,16 @@ export function createMessageHandler(options: {
       onStarted: () => {
         started = true;
         signalStarted();
+      },
+      onExecutionStarted: () => {
+        // 接续轮真正接手才销毁流程；发卡、目录或占位失败时，已确认答案仍可重试。
+        if (pendingClarification && runtime.clarificationFlows.get(pendingClarification.token) === pendingClarification) {
+          runtime.clarificationFlows.delete(pendingClarification.token);
+          if (pendingClarification.cardMessageId) {
+            void Promise.resolve().then(() => bot.updateCard(pendingClarification.cardMessageId!, buildClarificationSupersededCard(pendingClarification)))
+              .catch(error => console.warn("[澄清] 旧卡片更新失败:", (error as Error).message));
+          }
+        }
       },
     });
 

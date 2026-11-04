@@ -7,6 +7,9 @@ import type {
   CliRunStats,
 } from "./types.js";
 import { CLAUDE_APP_TOOL_NAMES, claudeAppToolArgs } from "./app-tools.js";
+import { z } from "zod";
+
+const EventEnvelopeSchema = z.object({ type: z.string() }).passthrough();
 
 interface ClaudeEvent {
   type?: unknown;
@@ -185,7 +188,9 @@ export class ClaudeAdapter implements CliAdapter {
   parseEvents(line: string): CliEvent[] {
     let event: ClaudeEvent;
     try {
-      event = JSON.parse(line) as ClaudeEvent;
+      const parsed = EventEnvelopeSchema.safeParse(JSON.parse(line));
+      if (!parsed.success) return [];
+      event = parsed.data;
     } catch {
       // CLI 的 stdout 偶尔混进非 JSON 日志行，直接跳过。
       return [];
@@ -254,7 +259,10 @@ export class ClaudeAdapter implements CliAdapter {
     if (event.type !== "result") return [];
 
     if (event.is_error) {
+      const stats = parseStats(event);
       return [
+        // 错误终态仍可能报告已计费 usage；只保留统计，不把错误文案当成完成答案。
+        ...(stats ? [{ type: "result" as const, answer: "", stats }] : []),
         {
           type: "error",
           message:

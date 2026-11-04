@@ -52,7 +52,7 @@ export const TASK_RECORD_STATUSES = [
 ] as const;
 export type TaskRecordStatus = (typeof TASK_RECORD_STATUSES)[number];
 
-/** 这一轮是被谁触发的：话题内发起 / 定时触发 / 团队交接 / 澄清或审批后的续跑。 */
+/** 这一轮是被谁触发的：话题内发起 / 定时触发 / 团队交接 / 澄清、审批或文档评论续跑。 */
 export const TASK_RUN_ORIGINS = [
   "user",
   "schedule",

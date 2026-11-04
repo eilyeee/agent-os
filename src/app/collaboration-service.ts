@@ -1,12 +1,15 @@
 /** bot 之间的派活：先登记交接单，再用卡片说明 + 新消息真正 @ 到对方。 */
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
-import { buildCollaborationCard } from "../im/card.js";
+import { buildCollaborationCard, buildSessionNoticeCard } from "../im/card.js";
 import type { CollaborationMessage } from "../core/collaboration.js";
+import { CollaborationRoundSchema } from "../core/collaboration.js";
 import { spentOnTask } from "../core/task-record.js";
 import { ensureAllowedWorkspace } from "../core/workspace.js";
 import { isBotRequestAllowed } from "../core/access-control.js";
 import type { AppRuntime, BotRuntime } from "./runtime.js";
+
+export const COLLABORATION_BUDGET_REASON = "任务已达到 token 预算上限，未继续派发。请在原话题发起新任务后重试。";
 
 export interface SendCollaborationOptions {
   runtime: AppRuntime;
@@ -27,6 +30,9 @@ export interface SendCollaborationOptions {
    * 只查历史的话看不到刚烧掉的这一轮——而失控往往就是从这一轮开始的。
    */
   spentThisTurn?: number;
+  signal?: AbortSignal;
+  /** @通知一旦提交给飞书就无法撤回；调用方在此同步关闭停止入口。 */
+  onDeliveryStarted?: () => void;
 }
 
 /**
@@ -40,12 +46,17 @@ export interface SendCollaborationOptions {
 export async function sendCollaborationMessage(
   options: SendCollaborationOptions,
 ): Promise<boolean> {
+  options.signal?.throwIfAborted();
+  if (!CollaborationRoundSchema.safeParse(options).success) {
+    throw new Error(`协作已达到交接轮次上限或轮次参数无效（${options.round}/${options.maxRounds}），本轮未继续派发。请在原话题发起新任务后重试。`);
+  }
   const target = options.runtime.botRuntimes.get(options.targetBotId);
   if (!target) throw new Error(`协作 bot 尚未就绪: ${options.targetBotId}`);
   if (!options.threadId || !isBotRequestAllowed(target.config, target.config.ownerOpenId ?? "", options.chatId)) {
     throw new Error("目标机器人的负责人或交接范围未获授权，请检查访问名单和原话题。");
   }
   await ensureAllowedWorkspace(options.workspaceDir, target.config);
+  options.signal?.throwIfAborted();
 
   const budget = options.sender.config.maxTokensPerTask;
   const spent =
@@ -64,6 +75,7 @@ export async function sendCollaborationMessage(
       ].join("\n"),
       true,
     );
+    options.signal?.throwIfAborted();
     return false;
   }
 
@@ -82,8 +94,9 @@ export async function sendCollaborationMessage(
   };
   options.runtime.collaborationInbox.register(collaboration);
 
+  let cardMessageId: string | undefined;
   try {
-    const cardMessageId = await options.sender.bot.replyCard(
+    cardMessageId = await options.sender.bot.replyCard(
       options.replyToMessageId,
       buildCollaborationCard({
         senderName: options.sender.identity.name,
@@ -97,8 +110,11 @@ export async function sendCollaborationMessage(
       true,
     );
     if (!cardMessageId) throw new Error("飞书没有返回协作卡片 message_id");
+    options.signal?.throwIfAborted();
 
     // 更新卡片不会触发 @提及通知，必须再发一条新消息才能真正点到对方。
+    // 这两步之间没有 await：接受停止后不能再提交通知，提交后也不能谎称已停止。
+    options.onDeliveryStarted?.();
     const mentionMessageId = await options.sender.bot.replyMention(
       cardMessageId,
       target.identity,
@@ -114,6 +130,13 @@ export async function sendCollaborationMessage(
       collaboration.dispatchId,
       collaboration.toBotId,
     );
+    if (cardMessageId && options.signal?.aborted) {
+      await options.sender.bot.updateCard(cardMessageId, buildSessionNoticeCard({
+        title: "交接已取消",
+        template: "grey",
+        detail: "本次交接已停止，未向队友发送取件通知。",
+      })).catch(error => console.error("[协作] 取消卡片更新失败:", (error as Error).message));
+    }
     throw error;
   }
 

@@ -61,6 +61,8 @@ export class SessionManager {
   private readonly now: () => Date;
   private readonly createId: () => string;
   private readonly store: SessionStore | undefined;
+  private mutationQueue: Promise<unknown> = Promise.resolve();
+  private readonly pendingUpdates = new Map<string, number>();
 
   constructor(options: SessionManagerOptions = {}) {
     this.now = options.now ?? (() => new Date());
@@ -68,26 +70,24 @@ export class SessionManager {
     this.store = options.store;
   }
 
-  static async open(
-    options: SessionManagerOptions = {},
-  ): Promise<SessionManager> {
+  static async open(options: SessionManagerOptions = {}): Promise<SessionManager> {
     const manager = new SessionManager(options);
     const restored = (await options.store?.load()) ?? [];
     for (const session of restored) {
-      manager.sessions.set(
-        sessionKey(session.botId, session.chatId, session.threadId),
-        session,
-      );
+      manager.sessions.set(sessionKey(session.botId, session.chatId, session.threadId), session);
     }
     return manager;
   }
 
-  get size(): number {
-    return this.sessions.size;
-  }
+  get size(): number { return this.sessions.size; }
 
   get(sessionId: string): Session | undefined {
-    return [...this.sessions.values()].find((session) => session.id === sessionId);
+    return [...this.sessions.values()].find(session => session.id === sessionId);
+  }
+
+  /** 绑定尚在提交时，应用层不能拿旧目录或旧原生标识启动一轮执行。 */
+  isUpdating(sessionId: string): boolean {
+    return this.pendingUpdates.has(sessionId);
   }
 
   async resolve(
@@ -96,61 +96,32 @@ export class SessionManager {
     botId = "default",
     workspaceDir = process.cwd(),
   ): Promise<ResolvedSession> {
-    const threadId = topicIdOf(message);
-    const key = sessionKey(botId, message.chatId, threadId);
-    const existing = this.sessions.get(key);
-    if (existing) return { session: existing, isNew: false };
-
-    const now = this.now().toISOString();
-    const session: Session = {
-      id: this.createId(),
-      botId,
-      threadId,
-      chatId: message.chatId,
-      cliId,
-      workspaceDir,
-      status: "creating",
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.sessions.set(key, session);
-    try {
-      await this.persist();
-    } catch (error) {
-      // 首次落盘失败就撤回内存会话，下一条消息可以重新创建，不会卡在 creating。
-      if (this.sessions.get(key) === session) this.sessions.delete(key);
-      // 和 replace() 一样：撤回内存之后要再写一次，把磁盘拉回同一个版本。
-      await this.persist().catch((rollbackError) => {
-        console.error(
-          "[会话] 回滚后重写失败，磁盘可能与内存不一致:",
-          (rollbackError as Error).message,
-        );
-      });
-      throw error;
-    }
-    return { session, isNew: true };
-  }
-
-  async transition(
-    sessionId: string,
-    nextStatus: SessionStatus,
-  ): Promise<Session> {
-    const current = this.get(sessionId);
-    if (!current) throw new Error(`会话不存在: ${sessionId}`);
-    if (!ALLOWED_TRANSITIONS[current.status].includes(nextStatus)) {
-      throw new Error(`会话 ${current.status} 不能切换到 ${nextStatus}`);
-    }
-    return this.replace(current, {
-      ...current,
-      status: nextStatus,
-      updatedAt: this.now().toISOString(),
+    return this.mutate(async () => {
+      const threadId = topicIdOf(message);
+      const key = sessionKey(botId, message.chatId, threadId);
+      const existing = this.sessions.get(key);
+      if (existing) return { session: existing, isNew: false };
+      const now = this.now().toISOString();
+      const session: Session = {
+        id: this.createId(), botId, threadId, chatId: message.chatId, cliId,
+        workspaceDir, status: "creating", createdAt: now, updatedAt: now,
+      };
+      await this.commit(session);
+      return { session, isNew: true };
     });
   }
 
-  async setCliSessionId(
-    sessionId: string,
-    cliSessionId: string,
-  ): Promise<Session> {
+  async transition(sessionId: string, nextStatus: SessionStatus): Promise<Session> {
+    return this.mutate(async () => {
+      const current = this.requireSession(sessionId);
+      if (!ALLOWED_TRANSITIONS[current.status].includes(nextStatus)) {
+        throw new Error(`会话 ${current.status} 不能切换到 ${nextStatus}`);
+      }
+      return this.commit({ ...current, status: nextStatus, updatedAt: this.now().toISOString() });
+    }, sessionId);
+  }
+
+  async setCliSessionId(sessionId: string, cliSessionId: string): Promise<Session> {
     if (!cliSessionId) throw new Error("CLI 会话 ID 不能为空");
     return this.updateCliSelection(sessionId, cliSessionId);
   }
@@ -160,74 +131,74 @@ export class SessionManager {
     return this.updateCliSelection(sessionId, undefined);
   }
 
-  /** 定时任务开出话题时打上标记，删除那条任务时据此找回本话题所有在飞的轮次。 */
+  /** 定时任务开出话题时打上标记，删除时据此找回本话题所有在飞轮次。 */
   async setScheduleId(sessionId: string, scheduleId: string): Promise<Session> {
     if (!scheduleId) throw new Error("定时任务 ID 不能为空");
-    const current = this.get(sessionId);
-    if (!current) throw new Error(`会话不存在: ${sessionId}`);
-    if (current.scheduleId === scheduleId) return current;
-    return this.replace(current, {
-      ...current,
-      scheduleId,
-      updatedAt: this.now().toISOString(),
-    });
+    return this.mutate(async () => {
+      const current = this.requireSession(sessionId);
+      if (current.scheduleId === scheduleId) return current;
+      return this.commit({ ...current, scheduleId, updatedAt: this.now().toISOString() });
+    }, sessionId);
   }
 
-  async setWorkspaceDir(
-    sessionId: string,
-    workspaceDir: string,
-  ): Promise<Session> {
-    const current = this.get(sessionId);
-    if (!current) throw new Error(`会话不存在: ${sessionId}`);
+  async setWorkspaceDir(sessionId: string, workspaceDir: string): Promise<Session> {
     if (!workspaceDir) throw new Error("工作目录不能为空");
-    if (current.workspaceDir === workspaceDir) return current;
-
-    // 旧 CLI 会话记着上一个项目的文件，留着会让模型引用错项目，
-    // 所以切目录时解除绑定，保留飞书话题，下一条任务重建 CLI 会话。
-    const { cliSessionId: _dropped, ...rest } = current;
-    return this.replace(current, {
-      ...rest,
-      workspaceDir,
-      updatedAt: this.now().toISOString(),
-    });
+    return this.mutate(async () => {
+      const current = this.requireSession(sessionId);
+      if (current.workspaceDir === workspaceDir) return current;
+      // 旧原生会话记着旧项目；目录提交成功时一并解除绑定，不能把失败变更带进后续更新。
+      const { cliSessionId: _dropped, ...rest } = current;
+      return this.commit({ ...rest, workspaceDir, updatedAt: this.now().toISOString() });
+    }, sessionId);
   }
 
-  private async updateCliSelection(
-    sessionId: string,
-    cliSessionId: string | undefined,
-  ): Promise<Session> {
-    const current = this.get(sessionId);
-    if (!current) throw new Error(`会话不存在: ${sessionId}`);
-    const { cliSessionId: _dropped, ...rest } = current;
-    return this.replace(current, {
-      ...rest,
-      ...(cliSessionId ? { cliSessionId } : {}),
-      updatedAt: this.now().toISOString(),
-    });
+  private updateCliSelection(sessionId: string, cliSessionId: string | undefined): Promise<Session> {
+    return this.mutate(async () => {
+      const current = this.requireSession(sessionId);
+      const { cliSessionId: _dropped, ...rest } = current;
+      return this.commit({ ...rest, ...(cliSessionId ? { cliSessionId } : {}), updatedAt: this.now().toISOString() });
+    }, sessionId);
   }
 
-  /** 唯一的写入口：落盘成功时内存与磁盘一起前进，失败则回滚内存。 */
-  private async replace(current: Session, updated: Session): Promise<Session> {
+  private requireSession(sessionId: string): Session {
+    const session = this.get(sessionId);
+    if (!session) throw new Error(`会话不存在: ${sessionId}`);
+    return session;
+  }
+
+  /** 读取、校验和更新一起排队；只排 save 会让后继操作继承前一次失败的暂存值。 */
+  private mutate<T>(operation: () => Promise<T>, sessionId?: string): Promise<T> {
+    if (sessionId) this.pendingUpdates.set(sessionId, (this.pendingUpdates.get(sessionId) ?? 0) + 1);
+    const run = async () => {
+      try { return await operation(); }
+      finally {
+        if (sessionId) {
+          const remaining = (this.pendingUpdates.get(sessionId) ?? 1) - 1;
+          if (remaining) this.pendingUpdates.set(sessionId, remaining);
+          else this.pendingUpdates.delete(sessionId);
+        }
+      }
+    };
+    const result = this.mutationQueue.then(run, run);
+    this.mutationQueue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  /** 只发布已落盘的快照；写失败时读者继续看旧版本，且写队列不会被污染。 */
+  private async commit(updated: Session): Promise<Session> {
     const key = sessionKey(updated.botId, updated.chatId, updated.threadId);
-    this.sessions.set(key, updated);
+    const staged = new Map(this.sessions);
+    staged.set(key, updated);
     try {
-      await this.persist();
+      await this.store?.save([...staged.values()]);
     } catch (error) {
-      if (this.sessions.get(key) === updated) this.sessions.set(key, current);
-      // 回滚内存还不够：这次失败的快照可能已经落到磁盘上了（写队列里排在后面的
-      // 那次成功写入会带着它）。再写一次，让磁盘和内存收敛回同一个版本。
-      await this.persist().catch((rollbackError) => {
-        console.error(
-          "[会话] 回滚后重写失败，磁盘可能与内存不一致:",
-          (rollbackError as Error).message,
-        );
+      // 防御存储在提交后抛错的实现；后继修改仍未出队，恢复的只能是完整旧快照。
+      if (this.store) await this.store.save([...this.sessions.values()]).catch(rollbackError => {
+        console.error("[会话] 回滚后重写失败，磁盘可能与内存不一致:", (rollbackError as Error).message);
       });
       throw error;
     }
+    this.sessions.set(key, updated);
     return updated;
-  }
-
-  private async persist(): Promise<void> {
-    await this.store?.save([...this.sessions.values()]);
   }
 }

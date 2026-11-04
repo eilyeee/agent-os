@@ -1,6 +1,6 @@
 /** 自建 MCP Server 的工具名，以及把它挂到各 CLI 上的启动参数。 */
-import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,14 +56,33 @@ function serverInvocation(): { command: string; args: string[] } {
   return { command: process.execPath, args: [tsxCli, server] };
 }
 
-let cachedConfigPath: string | undefined;
+/** 临时目录会被系统清理；每次确认文件仍完整，原子替换避免并发 CLI 读到半份配置。 */
+function temporaryConfigFile(prefix: string, content: string, extension: string): string {
+  const directory = join(tmpdir(), "agent-os-mcp");
+  mkdirSync(directory, { recursive: true });
+  const hash = createHash("sha256").update(content).digest("hex").slice(0, 16);
+  const path = join(directory, `${prefix}${hash}.${extension}`);
+  try {
+    if (readFileSync(path, "utf8") === content) return path;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const temporaryPath = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporaryPath, content, { encoding: "utf8", mode: 0o600 });
+    renameSync(temporaryPath, path);
+  } finally {
+    // 写入或替换失败也不能留下半成品，更不能把一个未成功写出的路径当作缓存。
+    rmSync(temporaryPath, { force: true });
+  }
+  return path;
+}
 
 /**
  * --mcp-config 同时接受 JSON 文件路径和 JSON 字符串，这里用文件。
  * 把一大段带引号的 JSON 放进 argv，在 Windows 的 cmd 下会被拆碎，工具就挂不上了。
  */
 function mcpConfigFile(): string {
-  if (cachedConfigPath) return cachedConfigPath;
   const invocation = serverInvocation();
   const content = JSON.stringify({
     mcpServers: {
@@ -74,16 +93,7 @@ function mcpConfigFile(): string {
       },
     },
   });
-  const directory = join(tmpdir(), "agent-os-mcp");
-  mkdirSync(directory, { recursive: true });
-  // 文件名跟随内容哈希：换了安装路径会自动写一份新的，不会读到旧配置。
-  const path = join(
-    directory,
-    `${createHash("sha256").update(content).digest("hex").slice(0, 16)}.json`,
-  );
-  writeFileSync(path, content, "utf8");
-  cachedConfigPath = path;
-  return path;
+  return temporaryConfigFile("", content, "json");
 }
 
 export function claudeAppToolArgs(): string[] {
@@ -100,43 +110,32 @@ export function codexAppToolArgs(): string[] {
   ];
 }
 
-let cachedDshPatchPath: string | undefined;
-
 export function dshAppToolArgs(): string[] {
-  if (!cachedDshPatchPath) {
-    const invocation = serverInvocation();
-    const directory = join(tmpdir(), "agent-os-mcp");
-    mkdirSync(directory, { recursive: true });
-    const bridge = dshRuntimeBridgeSource(Object.keys(DSH_APP_TOOL_NAMES));
-    const bridgePath = join(directory, `dsh-bridge-${createHash("sha256").update(bridge).digest("hex").slice(0, 16)}.mjs`);
-    writeFileSync(bridgePath, bridge, "utf8");
-    // JSON 是 YAML 子集；用文件传 patch，Windows 的 cmd 才不会拆碎引号和路径。
-    const content = JSON.stringify([
-      { id: "sandbox-policy", config: { mode: "workspace-write" } },
-      // headless 没有交互审批通道。never 拒绝需提权的动作，不能把它理解成自动批准。
-      { id: "approval", config: { policy: "never" } },
-      { id: "agent-loop", config: { agents: [] } },
-      // 原生必需入口依赖就绪服务：MCP 或桥接加载失败时，在模型执行前终止启动。
-      { id: "headless-runner", inject: ["headlessStartup", "agentOsBridge"] },
-      // 原生权限服务要求沙箱与审批默认值对应到同一个 preset，否则插件不会激活。
-      { id: "permission", config: {
-        defaultPreset: "agent-os",
-        presets: { "agent-os": { sandbox: "workspace-write", approval: "never" } },
-      } },
-      { insert: [{ id: "agent-os-bridge", name: bridgePath }, {
-        id: "agent-os-mcp",
-        name: "@deepseek-ai/dsh-mcp-client",
-        config: {
-          serverName: "agent_os", transport: "stdio",
-          command: invocation.command, args: invocation.args,
-          failOnStartupError: true,
-        },
-      }] },
-    ]);
-    const path = join(directory,
-      `dsh-${createHash("sha256").update(content).digest("hex").slice(0, 16)}.json`);
-    writeFileSync(path, content, "utf8");
-    cachedDshPatchPath = path;
-  }
-  return ["--patch", cachedDshPatchPath];
+  const invocation = serverInvocation();
+  const bridge = dshRuntimeBridgeSource(Object.keys(DSH_APP_TOOL_NAMES));
+  const bridgePath = temporaryConfigFile("dsh-bridge-", bridge, "mjs");
+  // JSON 是 YAML 子集；用文件传 patch，Windows 的 cmd 才不会拆碎引号和路径。
+  const content = JSON.stringify([
+    { id: "sandbox-policy", config: { mode: "workspace-write" } },
+    // headless 没有交互审批通道。never 拒绝需提权的动作，不能把它理解成自动批准。
+    { id: "approval", config: { policy: "never" } },
+    { id: "agent-loop", config: { agents: [] } },
+    // 原生必需入口依赖就绪服务：MCP 或桥接加载失败时，在模型执行前终止启动。
+    { id: "headless-runner", inject: ["headlessStartup", "agentOsBridge"] },
+    // 原生权限服务要求沙箱与审批默认值对应到同一个 preset，否则插件不会激活。
+    { id: "permission", config: {
+      defaultPreset: "agent-os",
+      presets: { "agent-os": { sandbox: "workspace-write", approval: "never" } },
+    } },
+    { insert: [{ id: "agent-os-bridge", name: bridgePath }, {
+      id: "agent-os-mcp",
+      name: "@deepseek-ai/dsh-mcp-client",
+      config: {
+        serverName: "agent_os", transport: "stdio",
+        command: invocation.command, args: invocation.args,
+        failOnStartupError: true,
+      },
+    }] },
+  ]);
+  return ["--patch", temporaryConfigFile("dsh-", content, "json")];
 }

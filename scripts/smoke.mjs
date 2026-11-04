@@ -2697,10 +2697,14 @@ await t("DSH 五个 MCP 工具精确还原命名空间，普通工具不触发�
   assert.equal(dshLine({ type: "tool_call", callId: "sub", tool: "subagent", input: { agent_preset: "tester" } })[0].subagentType, undefined, "请求过不能冒充已经创建验证子任务");
   assert.deepEqual(dshLine({ type: "tool_result", callId: "a", status: "error", truncated: true }), [{ type: "tool_end", toolUseId: "native:a", failed: true }]);
 });
-await t("DSH 截断请求一律拒绝，包括只剩 type 的超长事件", () => {
+await t("DSH 普通工具截断只影响进度，会话绑定与最终答案仍须无损", () => {
+  const write = dshLine({ type: "tool_call", callId: "large-write", tool: "write", input: { file_path: "large.txt", content: "字".repeat(4096) }, truncated: true });
+  assert.equal(write[0].type, "tool_start");
+  assert.equal(write[0].detail, "large.txt");
+  assert.equal(write[0].inputHash, undefined, "残缺参数不能冒充完整指纹");
+  assert.deepEqual(dshLine({ type: "tool_call", truncated: true }), [], "仅剩 type 的展示事件也不是执行失败");
   for (const event of [
-    { type: "tool_call", callId: "a", tool: "write", input: { content: "被截断" } },
-    { type: "tool_call" }, { type: "session", sessionId: "session-truncated" },
+    { type: "session", sessionId: "session-truncated" },
     { type: "final", text: "不完整" },
   ]) {
     const events = dshLine({ ...event, truncated: true });
@@ -2755,7 +2759,7 @@ await t("DSH Runner 拒绝缺失 final、失败终态、非零退出和截断派
     [[{ type: "text", text: "中途文本" }], 0, /没有返回最终结果/],
     [[{ type: "status", phase: "turn_end", reason: { kind: "aborted" } }, { type: "final", text: "假的成功" }], 0, /未完成/],
     [[{ type: "final", text: "假的成功" }], 1, /状态码 1/],
-    [[{ type: "tool_call", truncated: true }, { type: "final", text: "假的成功" }], 0, /截断/],
+    [[{ type: "final", text: "假的成功", truncated: true }], 0, /截断/],
   ]) {
     await assert.rejects(() => runCli({ adapter: dshProcess(events, code), prompt: "测试", cwd: process.cwd() }), pattern);
   }
@@ -2906,6 +2910,69 @@ function bridgeFixture(catalog = Object.keys(DSH_APP_TOOL_NAMES)) {
   };
   return { ctx, fire, capture, create, agents, guards, services, output, catalog: value => { names = value; capture(() => fire("tools/change")); } };
 }
+await t("DSH 原生子任务及后代用量进入总计，根会话、外部会话与重复结算不重计", async () => {
+  const f = bridgeFixture();
+  const root = f.create("usage-root");
+  const child = f.create("usage-child", root);
+  const grandchild = f.create("usage-grandchild", child, "tester");
+  const foreign = f.create("usage-foreign");
+  const usage = totalTokens => ({ inputTokens: totalTokens - 1000, outputTokens: 1000, totalTokens, cacheReadTokens: 0, cacheWriteTokens: 0 });
+  const commit = (agent, seq, totalTokens) => f.capture(() => f.fire("session/event", agent.session, { type: "assistant/message", seq, data: { usage: usage(totalTokens) } }));
+  commit(root, 1, 180_000); commit(child, 1, 60_000); commit(child, 1, 60_000);
+  // 原生失败尝试只把 usage 放在紧凑 stream 内，不能漏掉或取到较早的采样。
+  f.capture(() => f.fire("session/event", grandchild.session, { type: "assistant/attempt", seq: 1, data: { stream: [
+    { type: "chunk", time: 1, chunk: { type: "usage", usage: usage(10_000) } },
+    { type: "chunk", time: 2, chunk: { type: "usage", usage: usage(60_000) } },
+  ] } }));
+  commit(foreign, 1, 9_000_000);
+  const spoofed = { ...child.session };
+  f.capture(() => f.fire("session/event", spoofed, { type: "assistant/message", seq: 2, data: { usage: usage(9_000_000) } }));
+  f.capture(() => f.fire("agent/disposed", { agent: child })); commit(child, 2, 9_000_000);
+  const samples = f.output.filter(event => event.kind === "usage");
+  assert.deepEqual(samples.map(event => [event.rootSessionId, event.sessionId, event.usage.totalTokens]), [
+    [root.id, child.id, 60_000], [root.id, grandchild.id, 60_000],
+  ]);
+  const { runCli } = await R("cli/runner.js");
+  const result = await runCli({ adapter: dshProcess([...f.output,
+    { type: "status", phase: "step_end", usage: usage(180_000) }, { type: "final", text: "统计完成" },
+  ]), prompt: "统计", cwd: process.cwd() });
+  assert.equal(result.stats.totalTokens, 300_000);
+  assert.equal(result.stats.inputTokens, 297_000);
+  assert.deepEqual(result.stats.subagents, ["tester"]);
+});
+await t("DSH 子任务缺失或无效采样会撤下总量，不能展示主任务的部分和", async () => {
+  const { runCli } = await R("cli/runner.js");
+  for (const sample of [undefined, { totalTokens: -1 }, { inputTokens: 100, outputTokens: 20 }]) {
+    const f = bridgeFixture(); const root = f.create("missing-root"); const child = f.create("missing-child", root);
+    f.capture(() => f.fire("session/event", child.session, { type: "assistant/message", seq: 1, data: { usage: sample } }));
+    assert.equal(f.output.filter(event => event.kind === "usage").length, 1, "缺失采样也必须通知 Runner");
+    const result = await runCli({ adapter: dshProcess([...f.output,
+      { type: "status", phase: "step_end", usage: { inputTokens: 180_000, outputTokens: 20_000, totalTokens: 200_000 } },
+      { type: "final", text: "完成" },
+    ]), prompt: "统计", cwd: process.cwd() });
+    assert.equal(result.stats?.totalTokens, undefined);
+    assert.equal(result.stats?.inputTokens, sample?.inputTokens ? 180_100 : undefined);
+  }
+});
+await t("DSH 重试前的主任务与子任务消耗不能丢失，缺采样也不能伪造跨尝试总量", async () => {
+  const { runCli } = await R("cli/runner.js");
+  for (const complete of [true, false]) {
+    const adapter = dshProcess([
+      { type: "session", sessionId: "cost-retry" },
+      { type: "status", phase: "step_end", ...(complete ? { usage: { totalTokens: 180_000 } } : {}) },
+      dshBridge("usage", { rootSessionId: "cost-retry", sessionId: "cost-child", usage: { totalTokens: 120_000 } }),
+      dshBridge("subagent", { rootSessionId: "cost-retry", sessionId: "cost-child", role: "tester" }),
+      { type: "error", message: "API Error: 529 Overloaded" },
+    ], 1);
+    adapter.buildResumeArgs = () => dshProcess([
+      { type: "status", phase: "step_end", usage: { totalTokens: 100_000 } }, { type: "final", text: "恢复完成" },
+    ]).buildArgs();
+    const result = await withFastCliRetry(() => runCli({ adapter, prompt: "继续", cwd: process.cwd() }));
+    assert.equal(result.stats.totalTokens, complete ? 400_000 : undefined);
+    assert.equal(result.stats.retries, 1);
+    assert.deepEqual(result.stats.subagents, ["tester"]);
+  }
+});
 await t("DSH 原生启动门只在五个工具全部注册后开放，卸载不误报失败", () => {
   const f = bridgeFixture([]);
   assert.equal(f.services.has("agentOsBridge"), false);
@@ -3059,7 +3126,7 @@ await t("确认请求后的重试最终失败或取消，不能偷偷返回待�
     const controller = new AbortController();
     await assert.rejects(() => withFastCliRetry(() => runCli({ adapter: fake, cwd: process.cwd(), prompt: "测试", signal: controller.signal,
       onRetry: () => { if (cancel) controller.abort(); },
-    })), cancel ? /529/ : /不可重试的失败/);
+    })), cancel ? /取消/ : /不可重试的失败/);
     assert.equal(starts, cancel ? 1 : 2);
   }
 });
@@ -3079,5 +3146,286 @@ await t("DSH 原生 opaque 调用标识不能撤销桥接成功请求，开始�
   assert.equal(result.toolCalls.length, 1);
   assert.equal(result.toolCalls[0].input.title, "保留已确认请求");
   assert.equal(tracker.snapshot().completedCount, 2, "原生开始/结束标识未同步归一化");
+});
+await t("临时 MCP 配置和 DSH 桥接被清理或损坏后可原位重建", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const isolatedTmp = mkdtempSync(join(tmpdir(), "agentos-config-cleanup-"));
+  const moduleUrl = new URL("cli/app-tools.js", `file://${process.cwd()}/dist/`).href;
+  const code = `
+    import assert from 'node:assert/strict';
+    import fs from 'node:fs';
+    import {syncBuiltinESMExports} from 'node:module';
+    import {readFileSync,writeFileSync,unlinkSync,rmSync,existsSync,mkdirSync} from 'node:fs';
+    import {dirname} from 'node:path';
+    const {dshAppToolArgs,claudeAppToolArgs}=await import(${JSON.stringify(moduleUrl)});
+    const patch=dshAppToolArgs()[1], claude=claudeAppToolArgs()[1];
+    const bridge=JSON.parse(readFileSync(patch,'utf8')).flatMap(r=>r.insert??[]).find(r=>r.id==='agent-os-bridge').name;
+    const files=[claude,patch,bridge], originals=files.map(p=>readFileSync(p,'utf8'));
+    const rebuild=()=>{assert.equal(dshAppToolArgs()[1],patch);assert.equal(claudeAppToolArgs()[1],claude);};
+    for(const file of files){
+      unlinkSync(file);rebuild();assert.equal(readFileSync(file,'utf8'),originals[files.indexOf(file)]);
+      writeFileSync(file,'incomplete');rebuild();assert.equal(readFileSync(file,'utf8'),originals[files.indexOf(file)]);
+    }
+    rmSync(dirname(patch),{recursive:true});rebuild();
+    files.forEach((file,i)=>assert.equal(readFileSync(file,'utf8'),originals[i]));
+    unlinkSync(bridge);mkdirSync(bridge);assert.throws(rebuild);rmSync(bridge,{recursive:true});rebuild();
+    assert.ok(existsSync(bridge));
+    // 让真实文件写入在中途可被观察：读者只能看见完整旧版或完整新版，不能看见半份配置。
+    const oldContent=JSON.stringify({previousVersion:true});
+    writeFileSync(claude,oldContent);
+    const originalWrite=fs.writeFileSync;
+    let reads=0, partialSeen=false;
+    fs.writeFileSync=(file,content,options)=>{
+      if(typeof content!=='string'||content!==originals[0])return originalWrite(file,content,options);
+      const middle=Math.floor(content.length/2);
+      originalWrite(file,content.slice(0,middle),options);
+      const visible=readFileSync(claude,'utf8');reads++;
+      if(visible!==oldContent&&visible!==originals[0])partialSeen=true;
+      fs.appendFileSync(file,content.slice(middle),options);
+    };
+    syncBuiltinESMExports();
+    try{rebuild();}finally{fs.writeFileSync=originalWrite;syncBuiltinESMExports();}
+    assert.ok(reads>0,'必须实际观察写入窗口');
+    assert.equal(partialSeen,false,'正式配置暴露了半份写入内容');
+    assert.equal(readFileSync(claude,'utf8'),originals[0]);
+  `;
+  execFileSync(process.execPath, ["--input-type=module", "-e", code], { env: { ...process.env, TMPDIR: isolatedTmp, TMP: isolatedTmp, TEMP: isolatedTmp }, stdio: "pipe" });
+});
+await t("CLI 整轮绝对上限覆盖重试，超时时保留两次尝试已报告的用量", async () => {
+  const { createFakeAdapter } = await import("./fakes.mjs");
+  const { runCli, cliFailureResult, CLI_TIMEOUT_ERROR } = await R("cli/runner.js");
+  const first = createFakeAdapter([
+    { type: "session", sessionId: "deadline-retry" }, { type: "usage", stats: { totalTokens: 100_000 }, __delayMs: 750 },
+    { type: "error", message: "API Error: 529 Overloaded" },
+  ], { exitCode: 1 });
+  const second = createFakeAdapter([
+    { type: "usage", stats: { totalTokens: 200_000 }, __delayMs: 750 }, { type: "result", answer: "不能越过整轮上限" },
+  ]);
+  first.buildResumeArgs = (...args) => second.buildResumeArgs(...args);
+  const originalPerformance = globalThis.performance;
+  const originalTimer = globalThis.setTimeout;
+  let skippedBackoffMs = 0;
+  // 毫秒：只省掉 20s 真等待，时钟仍跨过完整退避，第二次只能花剩余 1.3s 的预算。
+  globalThis.performance = { now: () => originalPerformance.now() + skippedBackoffMs };
+  globalThis.setTimeout = (fn, ms, ...args) => ms === 20_000
+    ? originalTimer(() => { skippedBackoffMs += 20_000; fn(...args); }, 0)
+    : originalTimer(fn, ms, ...args);
+  let error;
+  try { error = await runCli({ adapter: first, cwd: process.cwd(), prompt: "测试", maxRuntimeMs: 21_300 }).then(() => null, error => error); }
+  finally { globalThis.performance = originalPerformance; globalThis.setTimeout = originalTimer; }
+  assert.equal(error?.name, CLI_TIMEOUT_ERROR);
+  assert.equal(second.prompts.length, 1, "样本必须进入第二次尝试，才能证明上限没有重置");
+  assert.equal(cliFailureResult(error)?.stats.totalTokens, 300_000);
+  assert.equal(cliFailureResult(error)?.stats.retries, 1);
+});
+await t("退避剩余预算不足时直接超时，提前唤醒也不能多启动一次或抹掉已知消耗", async () => {
+  const { createFakeAdapter } = await import("./fakes.mjs");
+  const { runCli, cliFailureResult, CLI_TIMEOUT_ERROR } = await R("cli/runner.js");
+  const adapter = createFakeAdapter([
+    { type: "usage", stats: { totalTokens: 100_000 } }, { type: "error", message: "API Error: 529 Overloaded" },
+  ], { exitCode: 1 });
+  const original = globalThis.setTimeout;
+  let backoff = false, advanced = false;
+  // 毫秒：把真实计时器向下取整的提前唤醒放大到 30ms，使边界回归稳定可复现。
+  globalThis.setTimeout = (fn, ms, ...args) => {
+    if (backoff && !advanced) { advanced = true; return original(fn, Math.max(0, ms - 30), ...args); }
+    return original(fn, ms, ...args);
+  };
+  let error;
+  try { error = await runCli({ adapter, cwd: process.cwd(), prompt: "测试", maxRuntimeMs: 400, onRetry: () => { backoff = true; } }).then(() => null, error => error); }
+  finally { globalThis.setTimeout = original; }
+  assert.equal(advanced, true, "必须实际进入退避窗口");
+  assert.equal(error?.name, CLI_TIMEOUT_ERROR);
+  assert.equal(adapter.prompts.length, 1);
+  assert.equal(cliFailureResult(error)?.stats.totalTokens, 100_000);
+  assert.equal(cliFailureResult(error)?.stats.retries, undefined);
+});
+await t("退避期间停止立即结束并保留消耗，不等待退避到期或重派工具请求", async () => {
+  const { createFakeAdapter } = await import("./fakes.mjs");
+  const { runCli, cliFailureResult } = await R("cli/runner.js");
+  const adapter = createFakeAdapter([
+    { type: "session", sessionId: "abort-backoff" },
+    { type: "usage", stats: { totalTokens: 100_000 } },
+    { type: "tool_call", toolUseId: "submitted", toolName: "dispatch_task", input: { task: "不得派发" }, completed: true },
+    { type: "error", message: "API Error: 529 Overloaded" },
+  ], { exitCode: 1 });
+  const controller = new AbortController();
+  const original = globalThis.setTimeout;
+  let backoffExpired = false;
+  globalThis.setTimeout = (fn, ms, ...args) => ms === 20_000 ? original(() => { backoffExpired = true; fn(...args); }, 20) : original(fn, ms, ...args);
+  let error;
+  try { error = await runCli({ adapter, cwd: process.cwd(), prompt: "测试", signal: controller.signal, onRetry: () => controller.abort() }).then(() => null, error => error); }
+  finally { globalThis.setTimeout = original; }
+  assert.match(error?.message, /取消/);
+  assert.equal(backoffExpired, false);
+  assert.equal(adapter.prompts.length, 1);
+  assert.equal(cliFailureResult(error)?.stats.totalTokens, 100_000);
+  assert.equal(cliFailureResult(error)?.sessionId, "abort-backoff");
+  assert.equal(cliFailureResult(error)?.toolCalls, undefined);
+});
+await t("Claude 和 Codex 错误终态保留原生用量，错误仍优先于统计结果", async () => {
+  const { createFakeAdapter } = await import("./fakes.mjs");
+  const { runCli, cliFailureResult } = await R("cli/runner.js");
+  const cases = [
+    [claude, [{ type: "system", subtype: "init", session_id: "claude-cost-failed" }, { type: "result", is_error: true, result: "固定执行失败", usage: { input_tokens: 200_000, output_tokens: 100_000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }]],
+    [codex, [{ type: "thread.started", thread_id: "codex-cost-failed" }, { type: "turn.failed", error: { message: "固定执行失败" }, usage: { input_tokens: 200_000, output_tokens: 100_000 } }]],
+  ];
+  for (const [real, events] of cases) {
+    const fake = createFakeAdapter(events, { id: real.id, capabilities: real.capabilities, exitCode: 1 });
+    fake.parseEvents = line => real.parseEvents(line);
+    const error = await runCli({ adapter: fake, cwd: process.cwd(), prompt: "测试" }).then(() => null, error => error);
+    assert.match(error?.message, /固定执行失败/);
+    assert.equal(cliFailureResult(error)?.stats.totalTokens, 300_000);
+    assert.equal(cliFailureResult(error)?.sessionId, `${real.id}-cost-failed`);
+    assert.equal(cliFailureResult(error)?.answer, "");
+  }
+});
+await t("最终重试失败仍累计所有已知消耗，任一尝试缺失采样时不伪造总量", async () => {
+  const { createFakeAdapter } = await import("./fakes.mjs");
+  const { runCli, cliFailureResult } = await R("cli/runner.js");
+  for (const complete of [true, false]) {
+    const adapter = createFakeAdapter([
+      { type: "session", sessionId: "terminal-retry" }, { type: "usage", stats: { totalTokens: 100_000 } }, { type: "error", message: "API Error: 529 Overloaded" },
+    ], { exitCode: 1 });
+    let resumes = 0;
+    adapter.buildResumeArgs = () => {
+      resumes++;
+      return createFakeAdapter([
+        ...(complete || resumes === 2 ? [{ type: "usage", stats: { totalTokens: resumes * 100_000 } }] : []),
+        { type: "error", message: "API Error: 529 Overloaded" },
+      ], { exitCode: 1 }).buildArgs("继续");
+    };
+    const error = await withFastCliRetry(() => runCli({ adapter, cwd: process.cwd(), prompt: "测试" })).then(() => null, error => error);
+    assert.match(error?.message, /529/);
+    assert.equal(resumes, 2);
+    assert.equal(cliFailureResult(error)?.stats.totalTokens, complete ? 400_000 : undefined);
+    assert.equal(cliFailureResult(error)?.stats.retries, 2);
+    assert.equal(cliFailureResult(error)?.sessionId, "terminal-retry");
+  }
+});
+await t("会话变更只发布已提交快照，失败目录不被后继更新继承，成功字段不会互相覆盖", async () => {
+  const { rmSync } = await import("node:fs");
+  const file = join(mkdtempSync(join(tmpdir(), "agentos-session-transaction-")), "sessions.json");
+  const store = new JsonSessionStore(file); const manager = await SessionManager.open({ store });
+  const { session } = await manager.resolve({ messageId: "m", chatId: "c", threadId: "t", rootId: "" }, "claude", "dev", "/original");
+  await manager.transition(session.id, "idle"); await manager.setCliSessionId(session.id, "original-cli");
+  const save = store.save.bind(store);
+  let release, entered; const gate = new Promise(resolve => { release = resolve; }); const saving = new Promise(resolve => { entered = resolve; });
+  let first = true;
+  store.save = async rows => {
+    if (!first) return save(rows);
+    first = false; entered(); await gate;
+    try { return await save(rows); } catch (error) { rmSync(`${file}.tmp`, { recursive: true }); throw error; }
+  };
+  mkdirSync(`${file}.tmp`);
+  const change = manager.setWorkspaceDir(session.id, "/failed-change").then(() => null, error => error);
+  await saving;
+  assert.equal(manager.get(session.id).workspaceDir, "/original");
+  assert.equal(manager.get(session.id).cliSessionId, "original-cli"); assert.equal(manager.isUpdating(session.id), true);
+  const reset = manager.clearCliSessionId(session.id); release();
+  assert.equal((await change).code, "EISDIR"); await reset;
+  assert.equal(manager.get(session.id).workspaceDir, "/original"); assert.equal(manager.get(session.id).cliSessionId, undefined);
+  assert.equal(JSON.parse(readFileSync(file, "utf8"))[0].workspaceDir, "/original");
+  await Promise.all([manager.setWorkspaceDir(session.id, "/committed"), manager.setCliSessionId(session.id, "new-cli"), manager.setScheduleId(session.id, "new-schedule")]);
+  const current = manager.get(session.id);
+  assert.equal(current.workspaceDir, "/committed"); assert.equal(current.cliSessionId, "new-cli"); assert.equal(current.scheduleId, "new-schedule");
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8"))[0], current); assert.equal(manager.isUpdating(session.id), false);
+});
+await t("并发创建在首次写入失败后重新创建，不复用未提交会话或遗留幽灵记录", async () => {
+  const { rmSync } = await import("node:fs");
+  const file = join(mkdtempSync(join(tmpdir(), "agentos-session-create-")), "sessions.json");
+  const store = new JsonSessionStore(file); let serial = 0;
+  const manager = await SessionManager.open({ store, createId: () => `session-${++serial}` });
+  const save = store.save.bind(store); let release, entered;
+  const gate = new Promise(resolve => { release = resolve; }); const saving = new Promise(resolve => { entered = resolve; }); let first = true;
+  store.save = async rows => {
+    if (!first) return save(rows);
+    first = false; entered(); await gate;
+    try { return await save(rows); } catch (error) { rmSync(`${file}.tmp`, { recursive: true }); throw error; }
+  };
+  mkdirSync(`${file}.tmp`); const address = { messageId: "m", chatId: "c", threadId: "t", rootId: "" };
+  const failed = manager.resolve(address, "claude", "dev", "/w").then(() => null, error => error);
+  await saving; assert.equal(manager.size, 0, "首个创建未提交，其他入口不能认领它");
+  const retry = manager.resolve(address, "claude", "dev", "/w"); release();
+  assert.equal((await failed).code, "EISDIR"); const resolved = await retry;
+  assert.equal(resolved.isNew, true); assert.equal(resolved.session.id, "session-2"); assert.equal(manager.get("session-1"), undefined);
+  assert.equal(manager.size, 1); assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).map(row => row.id), ["session-2"]);
+});
+await t("排队状态转换按最新已提交状态校验，closed 不被旧快照复活，失败不阻塞队列", async () => {
+  const file = join(mkdtempSync(join(tmpdir(), "agentos-session-state-")), "sessions.json");
+  const store = new JsonSessionStore(file); const manager = await SessionManager.open({ store });
+  const { session } = await manager.resolve({ messageId: "m", chatId: "c", threadId: "t", rootId: "" });
+  await manager.transition(session.id, "idle");
+  const save = store.save.bind(store); let release, entered;
+  const gate = new Promise(resolve => { release = resolve; }); const saving = new Promise(resolve => { entered = resolve; }); let first = true;
+  store.save = async rows => { if (first) { first = false; entered(); await gate; } return save(rows); };
+  const closing = manager.transition(session.id, "closed"); await saving;
+  assert.equal(manager.get(session.id).status, "idle");
+  const late = manager.transition(session.id, "active").then(() => null, error => error); release(); await closing;
+  assert.match((await late).message, /closed.*active/);
+  assert.equal(manager.get(session.id).status, "closed"); assert.equal(manager.isUpdating(session.id), false);
+  const next = await manager.resolve({ messageId: "next", chatId: "c", threadId: "next", rootId: "" });
+  assert.equal(next.isNew, true); assert.equal(JSON.parse(readFileSync(file, "utf8")).find(row => row.id === session.id).status, "closed");
+});
+await t("产品确认与创建写盘失败恢复全部旧对象、确认时间和过期状态，恢复后可重试落盘", async () => {
+  const { rmSync } = await import("node:fs");
+  const { JsonProductSpecFlowStore } = await R("core/product-spec-store.js");
+  const file = join(mkdtempSync(join(tmpdir(), "agentos-product-transaction-")), "products.json");
+  const store = new JsonProductSpecFlowStore(file);
+  const options = { taskId: "t", topicId: "topic", botId: "dev", sessionId: "s", ownerOpenId: "ou_owner", request: { deliveryMode: "lark-doc", title: "方案", summary: "说明", documentUrl: "https://example.feishu.cn/docx/Transaction" } };
+  const original = store.create(options); const before = readFileSync(file, "utf8");
+  mkdirSync(`${file}.tmp`); assert.throws(() => store.approve(original.token), /EISDIR/);
+  assert.equal(store.get(original.token), original); assert.equal(original.status, "pending"); assert.equal(Object.hasOwn(original, "approvedAt"), false);
+  assert.equal(readFileSync(file, "utf8"), before); rmSync(`${file}.tmp`, { recursive: true });
+  assert.equal(store.approve(original.token).status, "approved"); assert.equal(new JsonProductSpecFlowStore(file).get(original.token).status, "approved");
+  const pending = store.create({ ...options, topicId: "second-topic" }); const pendingSnapshot = structuredClone(store.snapshot()); const disk = readFileSync(file, "utf8");
+  mkdirSync(`${file}.tmp`); assert.throws(() => store.create({ ...options, topicId: "second-topic", taskId: "replacement" }), /EISDIR/);
+  assert.equal(pending.status, "pending"); assert.equal(store.get(pending.token), pending); assert.deepEqual(store.snapshot(), pendingSnapshot);
+  assert.equal(readFileSync(file, "utf8"), disk); rmSync(`${file}.tmp`, { recursive: true });
+  const replacement = store.create({ ...options, topicId: "second-topic", taskId: "replacement" });
+  assert.equal(pending.status, "expired"); assert.equal(new JsonProductSpecFlowStore(file).get(replacement.token).status, "pending");
+});
+await t("Claude 和 Codex 忽略 JSON null、原始值与无效事件封套，后续合法结果仍可完成", async () => {
+  const { runCli } = await R("cli/runner.js");
+  for (const real of [claude, codex]) {
+    const lines = ["null", "42", '"noise"', "[]", "{}", '{"type":null}', "non-json-log",
+      ...(real.id === "claude" ? [JSON.stringify({ type: "system", subtype: "init", session_id: "null-safe" }), JSON.stringify({ type: "result", result: "合法结果" })]
+        : [JSON.stringify({ type: "thread.started", thread_id: "null-safe" }), JSON.stringify({ type: "item.completed", item: { id: "answer", type: "agent_message", text: "合法结果" } }), JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } })]),
+    ];
+    const adapter = { id: real.id, capabilities: real.capabilities, displayName: real.displayName, command: process.execPath,
+      buildArgs: () => ["-e", "process.stdin.resume();process.stdin.on('end',()=>{for(const line of JSON.parse(process.argv[1]))console.log(line)});", JSON.stringify(lines)],
+      buildResumeArgs() { return this.buildArgs(); }, parseEvents: line => real.parseEvents(line) };
+    const result = await runCli({ adapter, cwd: process.cwd(), prompt: "测试" });
+    assert.equal(result.answer, "合法结果"); assert.equal(result.sessionId, "null-safe");
+  }
+});
+await t("解析与事件回调异常只结束本轮，取消和超时也等待无输出孙进程停止", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const runnerUrl = new URL("cli/runner.js", `file://${process.cwd()}/dist/`).href;
+  const fakeUrl = new URL("scripts/fakes.mjs", `file://${process.cwd()}/`).href;
+  const code = `
+    import assert from 'node:assert/strict';import {mkdtempSync,readFileSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';
+    const {runCli,CLI_EVENT_ERROR,CLI_TIMEOUT_ERROR}=await import(${JSON.stringify(runnerUrl)});const {waitFor}=await import(${JSON.stringify(fakeUrl)});
+    for(const mode of ['parser','callback','abort','timeout']){
+      const directory=mkdtempSync(join(tmpdir(),'agentos-tree-boundary-')),file=join(directory,'writes');
+      const grand="const fs=require('node:fs');process.on('SIGTERM',()=>{});fs.appendFileSync(process.argv[1],'x');setInterval(()=>fs.appendFileSync(process.argv[1],'x'),20);setTimeout(()=>process.exit(0),1200);";
+      const engine="const fs=require('node:fs');require('node:child_process').spawn(process.execPath,['-e',process.argv[2],process.argv[1]],{stdio:'ignore'});const beat=setInterval(()=>console.log(JSON.stringify({type:'result',answer:'running'})),30);const ready=setInterval(()=>{if(fs.existsSync(process.argv[1])&&fs.statSync(process.argv[1]).size){clearInterval(ready);clearInterval(beat);console.log(JSON.stringify({type:'context',usedTokens:1}));}},20);setInterval(()=>{},1000);";
+      let starts=0;const ctl=new AbortController();let settled=false;
+      const adapter={id:'claude',capabilities:{subagents:false},displayName:'树终止探针',command:process.execPath,buildArgs:()=>{starts++;return ['-e',engine,file,grand]},buildResumeArgs(){return this.buildArgs()},parseEvents:line=>{const event=JSON.parse(line);if(mode==='parser'&&event.type==='context')throw new Error('API Error: 529 parser failure');return [event]}};
+      const size=()=>{try{return readFileSync(file).length}catch{return 0}};
+      const running=runCli({adapter,cwd:directory,prompt:'fixed',signal:ctl.signal,...(mode==='timeout'?{idleTimeoutMs:200}:{}),onEvent:event=>{if(mode==='callback'&&event.type==='context')throw new Error('API Error: 529 callback failure')}}).then(()=>{settled=true;return null},error=>{settled=true;return error});
+      await waitFor(()=>size()>0,{label:'孙进程已开始实际写入'});if(mode==='abort')ctl.abort();
+      if(mode==='abort'||mode==='timeout'){
+        await new Promise(resolve=>setTimeout(resolve,350));
+        // Windows taskkill /F 没有 TERM 宽限期；各平台仍都要验证结算后写入不再增加。
+        if(process.platform!=='win32')assert.equal(settled,false,'孙进程仍活着时就提前结算');
+      }
+      const error=await running;assert.ok(error);assert.equal(starts,1,'内部事件错误不能因为529文案自动重试');
+      if(mode==='parser'||mode==='callback')assert.equal(error.name,CLI_EVENT_ERROR);
+      else if(mode==='timeout')assert.equal(error.name,CLI_TIMEOUT_ERROR);else assert.match(error.message,/取消/);
+      const before=size();await new Promise(resolve=>setTimeout(resolve,250));assert.equal(size(),before,'任务结算后孙进程仍在写文件');
+    }
+  `;
+  execFileSync(process.execPath, ["--input-type=module", "-e", code], { stdio: "pipe", timeout: 30_000 });
 });
 console.log(`\n${pass} passed`);

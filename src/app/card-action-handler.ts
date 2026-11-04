@@ -164,7 +164,21 @@ export function createCardActionHandler(options: {
       if (!isProductSpecOwner(flow, action)) {
         return { toast: { type: "warning", content: "只有任务发起人可以确认。" } };
       }
-      const approved = runtime.productSpecFlows.approve(flow.token);
+      const productSession = runtime.sessions.get(flow.sessionId);
+      if (!productSession || productSession.status === "closed") {
+        return { toast: { type: "error", content: "对应的产品会话已经失效，请重新发起方案评审。" } };
+      }
+      // 评论先同步占位再检查目录；只看异步落盘的 active 会放过准备期间的确认。
+      if (productSession.status !== "idle" || runtime.activeRuns.has(productSession.id) || runtime.sessions.isUpdating(productSession.id)) {
+        return { toast: { type: "warning", content: "方案仍在修改或会话正在准备，请等本轮结束并复查文档后再确认。" } };
+      }
+      let approved;
+      try {
+        approved = runtime.productSpecFlows.approve(flow.token);
+      } catch (error) {
+        console.error("[产品] 确认状态保存失败:", (error as Error).message);
+        return { toast: { type: "error", content: "方案确认未能保存，请稍后重试。原方案仍待确认。" } };
+      }
       if (!approved) {
         return { toast: { type: "warning", content: "方案状态已经更新。" } };
       }
@@ -203,7 +217,7 @@ export function createCardActionHandler(options: {
       // 否则占位之后、transition 落盘之前的那个窗口会被放过去。
       if (
         approvalSession.status === "active" ||
-        runtime.activeRuns.has(approvalSession.id)
+        runtime.activeRuns.has(approvalSession.id) || runtime.sessions.isUpdating(approvalSession.id)
       ) {
         return {
           toast: { type: "warning", content: "当前会话仍在执行，请稍后再点一次。" },
@@ -273,7 +287,7 @@ export function createCardActionHandler(options: {
         if (!botRuntime || !session || session.status === "closed") {
           return { toast: { type: "error", content: "对应的 CLI 会话已经失效。" } };
         }
-        if (session.status === "active" || runtime.activeRuns.has(session.id)) {
+        if (session.status === "active" || runtime.activeRuns.has(session.id) || runtime.sessions.isUpdating(session.id)) {
           return {
             toast: { type: "warning", content: "当前会话仍在执行，请稍后再点一次。" },
           };
@@ -591,7 +605,7 @@ export function createCardActionHandler(options: {
         }
         // 原生历史读取是异步的，返回时会话可能已被任务占用或切到了别的项目。
         const current = runtime.sessions.get(session.id);
-        if (!current || current.status === "closed" || current.status === "active" || runtime.activeRuns.has(session.id)
+        if (!current || current.status === "closed" || current.status === "active" || runtime.activeRuns.has(session.id) || runtime.sessions.isUpdating(session.id)
           || current.workspaceDir !== session.workspaceDir || current.cliSessionId !== session.cliSessionId) {
           return { toast: { type: "warning", content: "会话正在执行或已经更新，请稍后重新打开恢复列表。" } };
         }
@@ -645,6 +659,9 @@ export function createCardActionHandler(options: {
     }
     if (outcome === "already_stopping") {
       return { toast: { type: "info", content: "正在停止任务，请稍候。" } };
+    }
+    if (outcome === "committing") {
+      return { toast: { type: "info", content: "本轮结果已开始提交，无法撤回。请等待上方卡片更新。" } };
     }
     return { toast: { type: "success", content: "已发送停止指令。" } };
   };

@@ -35,6 +35,7 @@ export type CommandOutcome = "handled" | "continue";
 function bindingChanged(runtime: AppRuntime, session: Session): boolean {
   const current = runtime.sessions.get(session.id);
   return !current || current.status === "closed" || current.status === "active" || runtime.activeRuns.has(session.id)
+    || runtime.sessions.isUpdating(session.id)
     || current.workspaceDir !== session.workspaceDir || current.cliSessionId !== session.cliSessionId;
 }
 
@@ -161,7 +162,7 @@ export async function handleSessionCommand(options: {
       await bot.reply(msg.messageId, "只有当前任务发起人可以关闭执行中的会话。", hasThread);
       return "handled";
     }
-    if (active) {
+    if (active && !active.committing) {
       // /close 连会话一起关，和卡片按钮共用同一个停止信号。
       active.cancelMode = "close";
       active.controller.abort();
@@ -171,7 +172,9 @@ export async function handleSessionCommand(options: {
     }
     await bot.reply(
       msg.messageId,
-      "当前会话已关闭。需要继续时，请新开一个话题。",
+      active?.committing
+        ? "当前会话已关闭。本轮结果已开始提交，无法撤回。需要继续时，请新开一个话题。"
+        : "当前会话已关闭。需要继续时，请新开一个话题。",
       hasThread,
     );
     return "handled";

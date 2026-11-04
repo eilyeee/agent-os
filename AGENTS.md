@@ -97,7 +97,7 @@ src/cli/    engines            引擎差异，收敛成统一 CliEvent
   claude-adapter.ts            Claude Code 参数与 stream-json 解析
   codex-adapter.ts             Codex 参数与 JSONL 解析
   dsh-adapter.ts               DeepSeek Harness headless 参数、JSONL 与会话续接
-  dsh-runtime-bridge.ts         DSH 原生插件源码：工具就绪门、任务树校验与无损结果通道
+  dsh-runtime-bridge.ts         DSH 原生插件源码：工具就绪门、任务树校验、无损结果与后代用量
   registry.ts                  引擎注册表
   app-tools.ts                 应用工具名 + MCP 挂载参数
   native-sessions.ts           读取引擎原生历史会话
@@ -106,11 +106,12 @@ src/app/    orchestration      决定一条消息怎么流动
   runtime.ts                   进程内共享状态（含引擎查找 getAdapter）
   message-router.ts            一条飞书消息怎么走：交接认领与退回、准入、澄清接续
   task-runner.ts               任务主线：一次 CLI 执行的完整生命周期
+  task-history.ts              普通任务与文档评论共用的轮次历史与成本落盘
   command-handler.ts           斜杠命令分发
   card-action-handler.ts       卡片按钮回调
   collaboration-service.ts     派活：登记交接单 + 卡片 + @通知
   clarification 续跑           由 task-runner 的 resumeSession 承担
-  product-comment-runner.ts    云文档评论评审
+  product-comment-runner.ts    云文档评论评审、评论内澄清与其他应用请求退回话题
   scheduler.ts                 定时触发 → 开话题 → 走同一条主线
   commands.ts                  命令清单的唯一来源：/help 与两篇 README 都对照它
   cli-execution.ts             调用引擎的唯一入口
@@ -222,6 +223,9 @@ in-memory inbox state, not a new persisted session field.
 - **Atomic writes.** Persist as `file.tmp` then `rename()`. Serialize concurrent
   writes through a queue. On write failure, roll the in-memory value back — disk
   and memory must not diverge.
+  Session reads, checks and mutations all belong inside the queue; publish a new
+  snapshot only after saving succeeds. Task admission checks both pending writes
+  and whether the prepared workspace / engine binding is still current.
 - **Every new persisted field needs a migration branch.** Backfill old records in
   `load()` before Zod validation, then rewrite the file. Never tighten a schema in
   a way that discards existing user sessions.
@@ -739,3 +743,21 @@ Written for the humans *and* the agents who come next.
 - 工具已确认的问题在 529 续接成功后消失 → 重试只保留会话 id，丢掉失败尝试中已成功的应用请求 → 有界重试内保留带成功确认的请求，跨尝试加标识，取消和最终失败不交付缓存。
 - 普通工具失败误删已确认的 MCP 请求 → 把原生 opaque callId 与桥接复合标识放进同一个命名空间 → 原生和桥接分别加来源前缀，桥接各组成字段用无歧义元组编码。
 - 给缓存键加尝试序号的测试删了实现仍绿 → 只有一次失败加一次成功，第二项没经过缓存 Map → 用两次已确认后失败、第三次仅终态的样本跨过 Map 覆盖边界。
+- DSH 已成功写入大文件却被判失败 → 把普通工具的有界 JSONL 展示截断当成应用参数损坏 → 普通工具只影响进度，应用请求走无损桥接，会话绑定和最终答案才要求无损。
+- 停止已被接受，CLI 收尾却继续通知队友 → 取消信号只交给子进程，没覆盖应用层 await → 通知提交前逐次检查并撤回票据，提交边界同步关闭停止入口，不能承诺撤回已发出的请求。
+- 预算提示说未派发，历史与卡片却报交接成功 → 忽略派发服务的 false 返回，而且终态先被绿卡关闭 → 三条交接路径都检查发送结果，确定结局后只提交一次终态卡。
+- 评论里工具请求被空答案掩盖成「文档已更新」 → 评论入口只消费 answer → 澄清完整分段写回原评论并沿用会话，其他应用请求明确退回原话题，空终态不推断修改成功。
+- 子任务与失败重试消耗没有计入预算 → headless JSONL 只投影根会话，Runner 重试又只返回最后一次统计 → 桥接当前任务树后代的原生结算，跨 CLI 尝试累计计数，任一采样缺失时不发布伪精确总量。
+- 方案显示已确认后文档仍被评论任务改写 → 确认入口没检查同步占位与会话状态 → 准备和执行期间拒绝确认，结束并复查后再确认，不能只保护评论启动前。
+- 用普通消息回答澄清，发卡失败后已答内容消失 → 准备续接时就删除旧流程 → 接续轮真正接手后才让旧卡失效，启动失败保留同一任务和已答内容。
+- 评论花费 30 万，预算仍只看到原来 1 万 → 评论入口只续跑和回复，没有落任务历史 → 普通任务与评论共用收尾记录，沿用方案 taskId，并在释放占位前计入消耗。
+- 失败或取消的任务消耗显示为零 → 失败通道只抛 Error，已观察统计被留在 Runner 内部；部分适配器还忽略错误终态 usage → 错误携带统计与会话标识，丢弃待派发请求，所有结局共用落盘口径。
+- 配了总时长仍能跑三倍，或退避结束前多起一次空重试 → 每次尝试重置计时，退避计时又可能向下取整提前唤醒 → 整轮用单一截止时间，预算不够完成退避就直接超时，不能靠不足 1ms 的余量启动下一次。
+- 常驻几天后 MCP 一直加载失败，重启才恢复 → 缓存只记临时文件路径，系统清理文件后仍返回旧路径 → 每次确认配置与桥接内容完整，缺失或损坏时用独立临时文件原子重建。
+- 显式派活跑到 2/1、3/1 仍继续 → 轮次上限只挡自动返回 → 公共派发出口在发卡与登记票据前校验合法轮次，所有路径共用。
+- /cd 报失败，/new 却把失败目录写回磁盘 → 只序列化写盘，后继命令提前读到未提交对象 → 读、校验、变更整体入队，保存成功后才发布快照；准备消息后再次核对绑定。
+- 方案确认报错后内存已确认、重启又待确认 → 写盘失败没恢复流程对象，创建替代方案还提前过期旧卡 → 快照整个集合并原地恢复旧对象，保存失败不发送确认成功。
+- 审批显示已送达但 CLI 从没启动，澄清答案也消失 → 把进度卡成功当作引擎接收 → 卡片与自然文字续接都等原生会话或执行事件后再销毁流程，缺标识、spawn 失败和无确认错误保留重试。
+- Claude/Codex 已成功的 MCP 请求在 529 后消失 → 只识别 DSH 的完成标识 → 把匹配的原生成功 tool_end 也登记为确认，失败或仅开始的调用不进入跨重试缓存。
+- CLI 输出 JSON null 带走整个服务 → JSON.parse 成功就强转对象，readline 回调异常也没边界 → 先用 Zod 校验事件封套，解析或回调异常只终止本轮且不作为上游瞬时错误重试。
+- 解析异常或停止后新任务启动，旧孙进程仍在写文件 → 只等直接子进程 close，忽略 stdio 已重定向的后代 → 终止等待整组停止或强杀完成，状态落为 idle 后才删除运行占位。

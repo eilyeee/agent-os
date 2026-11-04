@@ -53,15 +53,31 @@ export class JsonProductSpecFlowStore extends ProductSpecFlowStore {
   }
 
   override create(options: CreateProductSpecFlowOptions): ProductSpecFlow {
-    const flow = super.create(options);
-    this.persist();
-    return flow;
+    return this.mutate(() => super.create(options));
   }
 
   override approve(token: string): ProductSpecFlow | undefined {
-    const flow = super.approve(token);
-    if (flow) this.persist();
-    return flow;
+    return this.mutate(() => super.approve(token));
+  }
+
+  /** 同步写盘没有 await 窗口；失败时恢复所有旧对象，连被新方案作废的旧卡也要复原。 */
+  private mutate<T>(operation: () => T): T {
+    const previous = [...this.flows.entries()].map(([token, flow]) => ({ token, flow, snapshot: structuredClone(flow) }));
+    try {
+      const result = operation();
+      if (result !== undefined) this.persist();
+      return result;
+    } catch (error) {
+      this.flows.clear();
+      for (const { token, flow, snapshot } of previous) {
+        for (const key of Object.keys(flow)) {
+          if (!Object.hasOwn(snapshot, key)) Reflect.deleteProperty(flow, key);
+        }
+        Object.assign(flow, snapshot);
+        this.flows.set(token, flow);
+      }
+      throw error;
+    }
   }
 
   private persist(): void {

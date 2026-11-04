@@ -6,6 +6,8 @@ export interface ActiveRun {
   ownerOpenId: string;
   /** 卡片按钮只停本轮执行，/close 连会话一起关，底层用同一个停止信号。 */
   cancelMode?: "stop" | "close";
+  /** 外部通知或持久化已开始提交，不能再承诺撤回这一轮。 */
+  committing?: boolean;
   /**
    * 这一轮由哪条定时任务触发。删掉那条任务时要顺着它找回本轮并中止——
    * 只摘掉存储记录的话，引擎还会按这条已经不存在的任务继续改用户的文件。
@@ -17,6 +19,7 @@ export type AbortTaskOutcome =
   | "stopped"
   | "already_stopping"
   | "not_found"
+  | "committing"
   | "forbidden";
 
 export function requestTaskAbort(
@@ -29,6 +32,7 @@ export function requestTaskAbort(
   if (!active) return "not_found";
   if (operatorOpenId !== active.ownerOpenId) return "forbidden";
   if (active.controller.signal.aborted) return "already_stopping";
+  if (active.committing) return "committing";
   active.cancelMode = "stop";
   active.controller.abort();
   return "stopped";
@@ -57,6 +61,8 @@ export function abortScheduleRuns(
   let alreadyStopping = 0;
   for (const run of activeRuns.values()) {
     if (run.scheduleId !== scheduleId) continue;
+    // 提交中的外部请求无法撤回，删定时任务只能阻止下一次触发。
+    if (run.committing) continue;
     if (run.controller.signal.aborted) {
       alreadyStopping += 1;
       continue;

@@ -24,13 +24,14 @@ const DshEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("error"), message: z.string(), truncated: z.boolean().optional() }),
 ]);
 const TruncatedCriticalEventSchema = z.object({
-  type: z.enum(["tool_call", "session", "final"]), truncated: z.literal(true),
+  type: z.enum(["session", "final"]), truncated: z.literal(true),
 });
 const BridgeSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("ready") }),
   z.object({ kind: z.literal("session"), sessionId: z.string().min(1).max(256) }),
   z.object({ kind: z.literal("error"), message: z.string() }),
   z.object({ kind: z.literal("subagent"), rootSessionId: z.string().min(1), sessionId: z.string().min(1), role: z.string().min(1).max(64) }),
+  z.object({ kind: z.literal("usage"), rootSessionId: z.string().min(1), sessionId: z.string().min(1), usage: UsageSchema.optional().catch(undefined) }),
   z.object({ kind: z.literal("app_tool"), rootSessionId: z.string().min(1), sessionId: z.string().min(1), callId: z.string().min(1), executionId: z.string().min(1), tool: z.string(), input: z.unknown(), failed: z.boolean() }),
 ]);
 const BridgeEnvelope = z.object({ type: z.literal("agent_os.bridge"), version: z.literal(1) });
@@ -79,6 +80,7 @@ export class DshAdapter implements CliAdapter {
       if (event.kind === "session") return [{ type: "session", sessionId: event.sessionId }];
       if (event.kind === "error") return [{ type: "error", message: event.message }];
       if (event.kind === "subagent") return [{ type: "subagent", subagentType: event.role }];
+      if (event.kind === "usage") return [usageEvent(event.usage)];
       const toolName = Object.hasOwn(DSH_APP_TOOL_NAMES, event.tool) ? DSH_APP_TOOL_NAMES[event.tool] : undefined;
       if (!toolName) return [];
       // 模型 callId 可跨步骤复用；会话作用域和原生 token 分配的执行标识缺一不可。
@@ -91,7 +93,7 @@ export class DshAdapter implements CliAdapter {
     }
     // 应用工具只消费桥接的无损最终结果，不使用原生 JSONL 截断后的入参或提前调用通知。
     if (NativeAppCall.safeParse(raw).success) return [];
-    // 上游会截断 8 KiB 字符串与 32 KiB 事件，审批和交接不能消费被改写的参数。
+    // 普通工具日志只是进度投影，截断不代表执行失败；只有会话绑定与最终答案必须无损。
     if (TruncatedCriticalEventSchema.safeParse(raw).success) {
       return [{ type: "error", message: "DeepSeek Harness 返回了被截断的事件，已停止处理。请缩短工具参数后重试。" }];
     }
@@ -107,13 +109,8 @@ export class DshAdapter implements CliAdapter {
         }
         if (event.phase === "turn_end" && event.reason?.kind === "completed") return [{ type: "usage", stats: { turns: 1 } }];
         if (event.phase !== "step_end") return [];
-        const usage = event.usage;
         // 缺失也是信息：某一步没报告的计数不能与其他步骤相加后冒充整轮总量。
-        return [{ type: "usage", stats: {
-          inputTokens: usage?.inputTokens, outputTokens: usage?.outputTokens,
-          totalTokens: usage?.totalTokens, cacheReadTokens: usage?.cacheReadTokens,
-          cacheCreationTokens: usage?.cacheWriteTokens,
-        } }];
+        return [usageEvent(event.usage)];
       }
       case "tool_call": {
         const detail = DetailSchema.safeParse(event.input);
@@ -122,7 +119,8 @@ export class DshAdapter implements CliAdapter {
           type: "tool_start", toolUseId: `native:${event.callId}`, toolName: event.tool,
           label: Object.hasOwn(TOOL_LABELS, event.tool) ? TOOL_LABELS[event.tool]! : `调用 ${event.tool}`,
           ...(text ? { detail: text.replace(/\s+/g, " ").slice(0, TOOL_DETAIL_MAX_CHARS) } : {}),
-          inputHash: createHash("sha256").update(JSON.stringify(event.input) ?? "").digest("hex"),
+          // 截断后两个不同的大参数可能相同，不能拿它们触发完整参数的重复检测。
+          ...(event.truncated ? {} : { inputHash: createHash("sha256").update(JSON.stringify(event.input) ?? "").digest("hex") }),
         }];
         return events;
       }
@@ -135,4 +133,13 @@ export class DshAdapter implements CliAdapter {
       case "error": return [{ type: "error", message: event.message }];
     }
   }
+}
+
+/** 根会话的 step_end 与子任务的原生结算共用计数语义，缺项绝不补零。 */
+function usageEvent(usage: z.infer<typeof UsageSchema> | undefined): CliEvent {
+  return { type: "usage", stats: {
+    inputTokens: usage?.inputTokens, outputTokens: usage?.outputTokens,
+    totalTokens: usage?.totalTokens, cacheReadTokens: usage?.cacheReadTokens,
+    cacheCreationTokens: usage?.cacheWriteTokens,
+  } };
 }

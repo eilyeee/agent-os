@@ -23,7 +23,7 @@ import {
   type CompactCliSessionResult,
 } from "../cli/native-compact.js";
 import type { CliRunResult } from "../cli/types.js";
-import { CLI_TIMEOUT_ERROR } from "../cli/runner.js";
+import { CLI_TIMEOUT_ERROR, cliFailureResult } from "../cli/runner.js";
 import { PRODUCT_DOCUMENT_SKILLS } from "../core/bot-registry.js";
 import { ensureAllowedWorkspace } from "../core/workspace.js";
 import { findApprovalRequest, formatApprovalOutcome } from "../core/approval.js";
@@ -34,7 +34,6 @@ import { findProductSpecRequest } from "../core/product-spec.js";
 import { findScheduleManageRequest } from "../core/schedule.js";
 import type { Session } from "../core/session-manager.js";
 import { TaskProgressTracker } from "../core/task-progress.js";
-import type { TaskProgressSnapshot } from "../core/task-progress.js";
 import { abortScheduleRuns, type ActiveRun } from "../core/task-abort.js";
 import { topicScopeIdOf } from "../core/topic-task.js";
 import type { TaskRunOrigin, TaskRunStatus } from "../core/task-record.js";
@@ -43,10 +42,11 @@ import {
   workspaceChanged,
   workspaceFingerprint,
 } from "./workspace-changes.js";
-import { sendCollaborationMessage } from "./collaboration-service.js";
+import { COLLABORATION_BUDGET_REASON, sendCollaborationMessage } from "./collaboration-service.js";
 import { sendResultNotification } from "./notification-service.js";
 import { assertProductSpecDocuments } from "./product-spec-documents.js";
 import { markSessionIdle } from "./session-view.js";
+import { recordCliTurn } from "./task-history.js";
 import type { AppRuntime, BotRuntime } from "./runtime.js";
 
 export interface TaskContext {
@@ -87,6 +87,8 @@ export interface TaskContext {
    * 调用方据此判断「这一轮确实接手了」——在此之前的任何失败都必须由调用方补偿。
    */
   onStarted?: () => void;
+  /** 原生会话或执行事件已到达，卡片成功不能冒充执行引擎接收了续跑。 */
+  onExecutionStarted?: () => void;
 }
 
 /** 任务准入检查：能不能在这个会话上开始一轮新的执行。 */
@@ -94,14 +96,23 @@ export function taskAdmission(
   runtime: AppRuntime,
   session: Session,
 ): { ok: true } | { ok: false; reason: string } {
-  if (session.status === "closed") {
+  const current = runtime.sessions.get(session.id);
+  if (!current) return { ok: false, reason: "对应的会话已经失效，请在原话题重试。" };
+  if (current.status === "closed") {
     return { ok: false, reason: "这个话题的会话已经关闭，请新开一个话题继续。" };
   }
-  if (session.status === "active") {
+  if (current.status === "active") {
     return { ok: false, reason: "当前会话还在执行，请等任务结束后再追问。" };
   }
   if (runtime.activeRuns.has(session.id)) {
     return { ok: false, reason: "当前会话还在收尾，请稍后再试。" };
+  }
+  if (runtime.sessions.isUpdating(session.id)) {
+    return { ok: false, reason: "当前会话正在保存更新，请稍后再试。" };
+  }
+  // 附件下载和通讯录查询会让出执行权，绑定可能已经成功切换，不能再使用入队时的快照。
+  if (current.workspaceDir !== session.workspaceDir || current.cliSessionId !== session.cliSessionId || current.cliId !== session.cliId) {
+    return { ok: false, reason: "会话绑定已经更新，这条消息未进入执行。请在原话题重试。" };
   }
   return { ok: true };
 }
@@ -115,15 +126,14 @@ export type TurnOutcome = TaskRunStatus;
 export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
   const { runtime, botRuntime, session } = ctx;
   const { bot } = botRuntime;
-  const adapter = runtime.getAdapter(session.cliId);
   const isCompacting = !!ctx.compact;
 
   // 先同步占位再 await：否则两条紧邻的消息会同时通过准入检查，起两个 CLI 进程。
   // 必须是「占位」而不是「覆盖」——覆盖会把仍在运行的那一轮从清单里挤掉，
   // 它的 CLI 就再也停不下来（停止按钮和 /close 都查不到它）。
-  if (runtime.activeRuns.has(session.id)) {
-    throw new Error("当前会话还在执行，请等任务结束后再追问。");
-  }
+  const admission = taskAdmission(runtime, session);
+  if (!admission.ok) throw new Error(admission.reason);
+  const adapter = runtime.getAdapter(session.cliId);
   const controller = new AbortController();
   const activeRun: ActiveRun = {
     controller,
@@ -222,6 +232,7 @@ export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
 
   // 压缩结果单独留一份：是否真的压缩过由 compacted 决定，不能用 message 是否为空来猜。
   let compactResult: CompactCliSessionResult | undefined;
+  let executionObserved = false;
   const execution: Promise<CliRunResult> = isCompacting
     ? compactCliSession({
         adapter,
@@ -242,6 +253,14 @@ export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
         session.cliSessionId,
         controller.signal,
         (event) => {
+          if (!executionObserved && (
+            ["session", "tool_start", "tool_end", "tool_call", "context", "subagent"].includes(event.type)
+            || (event.type === "result" && (event.answer || event.final || (event.stats?.totalTokens ?? 0) > 0))
+            || (event.type === "usage" && Object.values(event.stats).some(value => typeof value === "number" && value > 0))
+          )) {
+            executionObserved = true;
+            ctx.onExecutionStarted?.();
+          }
           if (
             event.type !== "tool_start" &&
             event.type !== "tool_end" &&
@@ -277,8 +296,10 @@ export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
     if (!isCompacting && result.stats?.contextWindowTokens) {
       runtime.contextWindows.set(session.id, result.stats.contextWindowTokens);
     }
+    controller.signal.throwIfAborted();
 
     if (isCompacting) {
+      beginTaskCommit(activeRun);
       outcome = "success";
       const compacted = compactResult?.compacted ?? false;
       await cardUpdater.finish(
@@ -306,28 +327,35 @@ export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
       result,
       cardUpdater,
       progressCardId,
+      activeRun,
     );
     if (handled) {
       outcome = handled.outcome;
       failureReason = handled.failureReason;
       return handled.outcome;
     }
-    outcome = "success";
+    console.log(
+      `[CLI] ${adapter.id} 完成 session_id=${result.sessionId ?? "(无)"}`,
+    );
+    const continued = await continueCollaboration(ctx, result.answer, activeRun, result.stats?.totalTokens);
+    beginTaskCommit(activeRun);
+    outcome = continued.outcome;
+    failureReason = continued.failureReason;
 
-    // 卡片是展示层：刷新失败不改变任务已经成功这个事实，
-    // 否则一次飞书抖动就会把成功报告成失败，还会顺带丢掉后续的团队流转。
+    // 终态只能提交一次：先确定后续协作结局，不能先关成绿卡再试图补一张失败卡。
+    // 展示失败仍只记日志，不改变已经确定的任务结局。
     await cardUpdater.finish(
       buildTaskCard({
         title: ctx.cardTitle,
-        status: "success",
-        detail: "执行完成",
+        status: outcome === "failed" ? "failed" : "success",
+        detail: outcome === "failed" ? "本轮执行已结束，后续协作未启动。" : outcome === "forwarded" ? "已交给团队成员继续" : "执行完成",
+        ...(failureReason ? { technicalDetail: failureReason } : {}),
         progress: progress.snapshot(),
         answer: result.answer,
         ...(result.stats ? { stats: result.stats } : {}),
       }),
     );
-    // 长答案续发同样是展示层：失败只记录，绝不改写「任务已经成功」这个事实，
-    // 更不能因此跳过下面的团队流转。
+    // 长答案续发同样是展示层，不能改写已经确定的结局。
     if (answerNeedsContinuation(result.answer)) {
       try {
         for (const chunk of splitLongText(answerContinuation(result.answer))) {
@@ -337,16 +365,10 @@ export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
         console.error("[卡片] 长答案续发失败:", (error as Error).message);
       }
     }
-    console.log(
-      `[CLI] ${adapter.id} 完成 session_id=${result.sessionId ?? "(无)"}`,
-    );
-
-    // 正常完成只更新卡片，不 @人：卡片 summary 已经出现在会话列表里，
-    // 每一步都推送会让用户很快把机器人屏蔽掉。异常和待决策才点名。
-    await continueCollaboration(ctx, result.answer, result.stats?.totalTokens);
-    return "success";
+    return outcome;
   } catch (error) {
     clearInterval(heartbeat);
+    runResult ??= cliFailureResult(error);
     if (controller.signal.aborted) {
       outcome = "cancelled";
       console.log("[CLI] 任务已取消");
@@ -366,6 +388,7 @@ export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
       return "cancelled";
     }
     const message = (error as Error).message;
+    beginTaskCommit(activeRun);
     outcome = "failed";
     failureReason = message;
     console.error("[CLI] 执行失败:", message);
@@ -375,7 +398,7 @@ export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
         status: "failed",
         detail: isCompacting
           ? "上下文整理失败，当前 CLI 会话没有改变。"
-          : message.includes("执行超时")
+          : error instanceof Error && error.name === CLI_TIMEOUT_ERROR
             ? "执行超时被中止。工作区里可能已经有改到一半的内容，先用 git 看一眼再决定重试还是回退。"
             : "执行没有完成。你可以调整指令后，在当前话题里重试。",
         technicalDetail: message,
@@ -396,12 +419,18 @@ export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
       await workspaceFingerprint(session.workspaceDir),
     );
     clearInterval(heartbeat);
-    await releaseSession(runtime, session.id, controller);
     // 落一条历史，和清理 activeRuns 一样属于「每条退出路径都要做」的收尾。
     // /compact 是上下文维护不是任务，不进历史。
     if (!isCompacting && outcome) {
-      await recordTaskRun({
-        ctx,
+      await recordCliTurn({
+        runtime,
+        session,
+        taskId: ctx.taskId,
+        origin: ctx.origin,
+        ownerOpenId: ctx.ownerOpenId,
+        ...(ctx.ownerName ? { ownerName: ctx.ownerName } : {}),
+        title: ctx.cardTitle,
+        prompt: ctx.taskText,
         status: outcome,
         startedAt,
         progress: progress.snapshot(),
@@ -411,73 +440,7 @@ export async function runCliTurn(ctx: TaskContext): Promise<TurnOutcome> {
         ...(editedFiles !== undefined ? { editedFiles } : {}),
       });
     }
-  }
-}
-
-/**
- * 任务记录是可观测性功能：写失败只打日志。
- * 它不能改写任务结局，不能阻断团队流转，也不能把会话卡在执行中。
- */
-async function recordTaskRun(options: {
-  ctx: TaskContext;
-  status: TurnOutcome;
-  startedAt: Date;
-  progress: TaskProgressSnapshot;
-  cardMessageId: string;
-  result?: CliRunResult;
-  failureReason?: string;
-  /** 这一轮改没改过工作区。undefined = 不知道，不是「没改过」。 */
-  editedFiles?: boolean;
-}): Promise<void> {
-  const { ctx, status, startedAt, progress, result } = options;
-  const { session } = ctx;
-  // ctx.session 是开跑前的快照；失败轮也要从最新绑定取回已经落盘的原生标识。
-  const cliSessionId = result?.sessionId ?? ctx.runtime.sessions.get(session.id)?.cliSessionId ?? session.cliSessionId;
-  try {
-    await ctx.runtime.taskRecords.append({
-      taskId: ctx.taskId,
-      botId: ctx.botRuntime.config.id,
-      chatId: session.chatId,
-      threadId: session.threadId,
-      sessionId: session.id,
-      cliId: session.cliId,
-      ...(cliSessionId ? { cliSessionId } : {}),
-      workspaceDir: session.workspaceDir,
-      origin: ctx.origin,
-      ownerOpenId: ctx.ownerOpenId,
-      ...(ctx.ownerName ? { ownerName: ctx.ownerName } : {}),
-      title: ctx.cardTitle,
-      // 记录用户看得懂的任务原文，而不是拼好角色与团队上下文的整段提示词。
-      prompt: ctx.taskText,
-      status,
-      answer: result?.answer ?? "",
-      ...(options.failureReason ? { failureReason: options.failureReason } : {}),
-      startedAt: startedAt.toISOString(),
-      finishedAt: new Date().toISOString(),
-      toolCount: progress.toolCount,
-      completedToolCount: progress.completedCount,
-      ...(result?.stats?.turns !== undefined ? { turns: result.stats.turns } : {}),
-      // 派生过哪些子 Agent、重试过几次——都是观察出来的，不是引擎自报的
-      ...(result?.stats?.subagents?.length
-        ? { subagents: result.stats.subagents }
-        : {}),
-      ...(result?.stats?.retries ? { retries: result.stats.retries } : {}),
-      ...(options.editedFiles !== undefined
-        ? { editedFiles: options.editedFiles }
-        : {}),
-      ...(result?.stats?.spinningOn
-        ? { spinningOn: result.stats.spinningOn }
-        : {}),
-      ...(result?.stats?.totalTokens !== undefined
-        ? { totalTokens: result.stats.totalTokens }
-        : {}),
-      cardMessageId: options.cardMessageId,
-    });
-    console.log(
-      `[历史] 已记录 status=${status} origin=${ctx.origin} task=${ctx.taskId}`,
-    );
-  } catch (error) {
-    console.error("[历史] 任务记录写入失败:", (error as Error).message);
+    await releaseSession(runtime, session.id, controller);
   }
 }
 
@@ -487,13 +450,13 @@ async function releaseSession(
   sessionId: string,
   controller: AbortController,
 ): Promise<void> {
-  if (runtime.activeRuns.get(sessionId)?.controller === controller) {
-    runtime.activeRuns.delete(sessionId);
-  }
   try {
     await markSessionIdle(runtime.sessions, sessionId);
   } catch (error) {
     console.error("[会话] 保存空闲状态失败:", (error as Error).message);
+  } finally {
+    // 状态提交之前仍在收尾，不能先摘占位再让下一条消息读到旧 active。
+    if (runtime.activeRuns.get(sessionId)?.controller === controller) runtime.activeRuns.delete(sessionId);
   }
 }
 
@@ -511,12 +474,15 @@ async function handleAppToolOutcome(
   result: CliRunResult,
   cardUpdater: ThrottledCardUpdater,
   cardMessageId: string,
+  activeRun: ActiveRun,
 ): Promise<{ outcome: TurnOutcome; failureReason?: string } | undefined> {
   const { runtime, botRuntime, session } = ctx;
   const { bot, config } = botRuntime;
+  activeRun.controller.signal.throwIfAborted();
 
   const approvalRequest = findApprovalRequest(result.toolCalls);
   if (approvalRequest) {
+    beginTaskCommit(activeRun);
     const flow = runtime.approvalFlows.create({
       taskId: ctx.taskId,
       botId: config.id,
@@ -547,6 +513,7 @@ async function handleAppToolOutcome(
 
   const clarificationRequest = findClarificationRequest(result.toolCalls);
   if (clarificationRequest) {
+    beginTaskCommit(activeRun);
     const flow = runtime.clarificationFlows.create({
       taskId: ctx.taskId,
       topicId: topicScopeIdOf(session.chatId, session.threadId),
@@ -585,6 +552,7 @@ async function handleAppToolOutcome(
     if (productSpecRequest.deliveryMode === "local") {
       await assertProductSpecDocuments(session.workspaceDir, productSpecRequest);
     }
+    beginTaskCommit(activeRun);
     const flow = runtime.productSpecFlows.create({
       taskId: ctx.taskId,
       topicId: topicScopeIdOf(session.chatId, session.threadId),
@@ -612,6 +580,7 @@ async function handleAppToolOutcome(
 
   const scheduleRequest = findScheduleManageRequest(result.toolCalls);
   if (scheduleRequest) {
+    beginTaskCommit(activeRun);
     const applied = await applyScheduleRequest(ctx, scheduleRequest);
     console.log(
       `[定时] 工具调用 action=${scheduleRequest.action} 结果=${applied.ok ? "成功" : "失败"}`,
@@ -626,6 +595,7 @@ async function handleAppToolOutcome(
   if (dispatchRequest) {
     const target = runtime.teamRegistry.get(dispatchRequest.toBotId);
     if (!target || dispatchRequest.toBotId === config.id) {
+      beginTaskCommit(activeRun);
       await cardUpdater.finish(
         buildSessionNoticeCard({
           title: "派发失败",
@@ -642,9 +612,11 @@ async function handleAppToolOutcome(
     // 先真正派出去再宣布成功：反过来的话，派发失败会留下一张
     // 「已交给团队成员继续」的绿卡，而任务其实已经掉了。
     // 这里不吞异常——runCliTurn 的 catch 会渲染带技术细节的红色失败卡。
-    await sendCollaborationMessage({
+    const sent = await sendCollaborationMessage({
       runtime,
       sender: botRuntime,
+      signal: activeRun.controller.signal,
+      onDeliveryStarted: () => beginTaskCommit(activeRun),
       ...(result.stats?.totalTokens
         ? { spentThisTurn: result.stats.totalTokens }
         : {}),
@@ -659,6 +631,15 @@ async function handleAppToolOutcome(
       workspaceDir: dispatchRequest.workspaceDir ?? session.workspaceDir,
       prompt: dispatchRequest.task,
     });
+    if (!sent) {
+      beginTaskCommit(activeRun);
+      await cardUpdater.finish(buildSessionNoticeCard({
+        title: "任务未派发",
+        template: "red",
+        detail: COLLABORATION_BUDGET_REASON,
+      }));
+      return { outcome: "failed", failureReason: COLLABORATION_BUDGET_REASON };
+    }
     await cardUpdater.finish(
       buildTaskCard({
         title: ctx.cardTitle,
@@ -856,6 +837,7 @@ export async function resumeSession(
   const admission = taskAdmission(options.runtime, session);
   if (!admission.ok) throw new Error(admission.reason);
 
+  let started = false;
   await runCliTurn({
     runtime: options.runtime,
     botRuntime: options.botRuntime,
@@ -875,23 +857,30 @@ export async function resumeSession(
     prompt: options.text,
     taskText: options.text,
     cardTitle: options.runtime.getAdapter(session.cliId).displayName,
+    onExecutionStarted: () => { started = true; },
   });
+  // 卡片成功、甚至 shell 启动都不代表引擎接收了结论；未观察到原生执行时保留人类决定。
+  if (!started) throw new Error("本轮没有进入执行，请在原话题重试；已确认的答案或审批结论仍保留。");
 }
 
 /** 一轮结束后的团队流转：返工、自动审查，或只发一条完成通知。 */
 async function continueCollaboration(
   ctx: TaskContext,
   answer: string,
+  activeRun: ActiveRun,
   /** 本轮花掉的 token：预算检查要算上它，本轮记录此刻还没落盘。 */
   spentThisTurn?: number,
-): Promise<void> {
+): Promise<{ outcome: TurnOutcome; failureReason?: string }> {
   const { runtime, botRuntime, session } = ctx;
   const { config } = botRuntime;
   try {
+    activeRun.controller.signal.throwIfAborted();
     if (ctx.collaboration && ctx.collaboration.round < ctx.collaboration.maxRounds) {
-      await sendCollaborationMessage({
+      const sent = await sendCollaborationMessage({
         runtime,
         sender: botRuntime,
+        signal: activeRun.controller.signal,
+        onDeliveryStarted: () => beginTaskCommit(activeRun),
         replyToMessageId: ctx.replyToMessageId,
         targetBotId: ctx.collaboration.fromBotId,
         chatId: session.chatId,
@@ -904,12 +893,14 @@ async function continueCollaboration(
         prompt: answer || "任务已完成，请检查当前工作目录。",
         ...(spentThisTurn ? { spentThisTurn } : {}),
       });
-      return;
+      return sent ? { outcome: "forwarded" } : { outcome: "failed", failureReason: COLLABORATION_BUDGET_REASON };
     }
     if (!ctx.collaboration && config.reviewBy) {
-      await sendCollaborationMessage({
+      const sent = await sendCollaborationMessage({
         runtime,
         sender: botRuntime,
+        signal: activeRun.controller.signal,
+        onDeliveryStarted: () => beginTaskCommit(activeRun),
         replyToMessageId: ctx.replyToMessageId,
         targetBotId: config.reviewBy,
         chatId: session.chatId,
@@ -926,8 +917,9 @@ async function continueCollaboration(
           "请直接读取代码和改动，指出明确问题；没有问题时说明检查通过。",
         ].join("\n\n"),
       });
-      return;
+      return sent ? { outcome: "forwarded" } : { outcome: "failed", failureReason: COLLABORATION_BUDGET_REASON };
     }
+    beginTaskCommit(activeRun);
     if (ctx.collaboration && ctx.senderRuntime) {
       await sendResultNotification({
         bot: botRuntime.bot,
@@ -937,16 +929,26 @@ async function continueCollaboration(
         replyInThread: ctx.replyInThread,
       });
     }
+    return { outcome: "success" };
   } catch (error) {
+    // 通知尚未提交时的取消属于停止任务，不能被协作兜底吞成成功。
+    if (activeRun.controller.signal.aborted) throw error;
     const message = (error as Error).message;
     console.error("[协作] 派发失败:", message);
-    // 兜底回复本身失败也不能往外抛：它一抛就会把上面那轮成功改写成失败。
+    // 协作失败已确定；兜底回复自身出错不能盖掉真实原因，也不能阻断会话收尾。
     await botRuntime.bot
       .reply(ctx.replyToMessageId, `协作派发失败：${message}`, ctx.replyInThread)
       .catch((replyError) =>
         console.error("[协作] 失败提示发送失败:", (replyError as Error).message),
       );
+    return { outcome: "failed", failureReason: `协作派发失败：${message}` };
   }
+}
+
+/** 持久化或外部通知开始提交后不能承诺撤回；检查与锁定必须同步完成。 */
+function beginTaskCommit(activeRun: ActiveRun): void {
+  activeRun.controller.signal.throwIfAborted();
+  activeRun.committing = true;
 }
 
 /** 下载消息里的图片与文件，失败不阻断任务。 */

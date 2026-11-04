@@ -9,6 +9,7 @@ import type { Readable, Writable } from "node:stream";
 
 /** SIGTERM 之后还没退出就升级到 SIGKILL 的等待时间。 */
 const ESCALATE_TO_SIGKILL_MS = 5_000;
+const TERMINATION_POLL_MS = 50; // 毫秒：及时释放已结束的进程组，避免等待完整的强杀宽限期。
 
 /**
  * 只属于 Agent OS 的凭证，不传给引擎子进程。
@@ -40,58 +41,62 @@ export function childEnvironment(
 export function killCli(
   child: ChildProcess,
   signal: NodeJS.Signals = "SIGTERM",
-): void {
+): Promise<void> {
   if (!child.pid) {
     child.kill(signal);
-    return;
+    return Promise.resolve();
   }
   if (process.platform === "win32") {
-    // Windows 上 child.pid 指向 cmd，taskkill /T 才能连同 claude.exe/codex.exe 一起杀。
-    const taskkill = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
-      windowsHide: true,
-      stdio: "ignore",
+    // Windows 的 cmd 只是启动器，必须等 taskkill /T /F 处理整棵树，不能只等 cmd 退出。
+    return new Promise(resolve => {
+      let fallback = false;
+      const taskkill = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore" });
+      // spawn 失败也会触发 close；此时要等兜底终止完成，不能被该 close 提前释放。
+      taskkill.once("close", () => { if (!fallback) resolve(); });
+      taskkill.once("error", error => {
+        fallback = true;
+        console.error("[进程] taskkill 调用失败:", error.message);
+        child.kill(signal);
+        if (child.exitCode !== null || child.signalCode !== null) resolve();
+        else child.once("close", () => resolve());
+      });
     });
-    // taskkill 不在 PATH 上时会抛 ENOENT，未监听同样是未捕获异常。
-    taskkill.on("error", (error) => {
-      console.error("[进程] taskkill 调用失败:", error.message);
-      child.kill(signal);
-    });
-    return;
   }
 
-  // POSIX：detached 让子进程自成进程组，负号 pid 才能把整组一起signal。
+  // POSIX：detached 让子进程自成进程组；stdio 被重定向的孙进程也必须在组内一并停止。
   const killGroup = (sig: NodeJS.Signals) => {
-    try {
-      process.kill(-child.pid!, sig);
-    } catch {
-      // 进程组已经不在（正常退出），退回到只杀直接子进程。
-      try {
-        child.kill(sig);
-      } catch {
-        // 已经退出，忽略。
-      }
+    try { process.kill(-child.pid!, sig); }
+    catch {
+      try { child.kill(sig); } catch { /* 进程已退出，无需再发送信号。 */ }
     }
   };
-
-  // 升级条件必须看「进程组里还有没有人」。
-  // 直接子进程通常会立刻响应 SIGTERM 退出，它的 exitCode/signalCode 随即变成非空，
-  // 拿它当判据的话，升级永远不会触发——而真正赖着不走的恰恰是忽略 SIGTERM 的孙进程。
   const groupAlive = (): boolean => {
-    try {
-      // 信号 0 只做存在性探测：组里还有任何成员就返回成功。
-      process.kill(-child.pid!, 0);
-      return true;
-    } catch {
-      return false;
-    }
+    try { process.kill(-child.pid!, 0); return true; }
+    catch { return false; }
   };
-
   killGroup(signal);
-  if (signal === "SIGKILL") return;
-  const escalation = setTimeout(() => {
-    if (groupAlive()) killGroup("SIGKILL");
-  }, ESCALATE_TO_SIGKILL_MS);
-  escalation.unref();
+  if (signal === "SIGKILL" || !groupAlive()) return Promise.resolve();
+
+  return new Promise(resolve => {
+    let poll: ReturnType<typeof setTimeout> | undefined;
+    let escalation: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      if (poll) clearTimeout(poll);
+      if (escalation) clearTimeout(escalation);
+      resolve();
+    };
+    const check = () => {
+      if (!groupAlive()) { finish(); return; }
+      poll = setTimeout(check, TERMINATION_POLL_MS);
+    };
+    // 父进程 close 后组内还可能有人；计时器要持有事件循环，不能让等待终止的 Promise 悬空退出。
+    escalation = setTimeout(() => {
+      if (groupAlive()) killGroup("SIGKILL");
+      // SIGKILL 后僵尸进程可能暂留，但已不能执行或写文件，不能等到系统回收才释放。
+      finish();
+    }, ESCALATE_TO_SIGKILL_MS);
+    check();
+  });
 }
 
 /**

@@ -72,7 +72,8 @@ the way of working built on top.
 **Team mode** — let a group of agents run itself
 
 - Several bots in one group, each with its own credentials, role and default engine
-- Explicit handoff with `dispatch_task`, capped by a round limit and token budget
+- Explicit handoff with `dispatch_task`, capped by a round limit and token budget;
+  the round limit applies to explicit dispatches and automatic returns alike
 - Code review and tests run inside the developer CLI as sub-agents when the engine
   supports them. Automatic cross-bot review with `reviewBy` is optional and off
   in the example configurations
@@ -80,6 +81,34 @@ the way of working built on top.
 - Product specs land as local Markdown **or** a Lark cloud doc — one authoritative
   artifact, never two out of sync
 - Review a spec by commenting in the cloud doc and @-mentioning the product manager
+
+Clarification questions and all options are posted back to the original comment.
+Reply there and @-mention the bot to continue the same session. Approval, handoff
+and scheduling requests must be started in the original Lark thread; comments
+cannot approve operations. The existing spec confirmation card stays valid.
+
+Comment runs count toward the original spec's task history and budget. A spec
+cannot be confirmed while its session is preparing or editing. Failed and
+cancelled turns retain usage reported by the engine; unreported counters remain
+unknown.
+
+Stopping before a teammate notification is submitted removes the undelivered
+handoff. Once a notification or application result starts committing, the stop
+button explains that it cannot be withdrawn. Budget refusal is recorded as a
+failure with a reason, never as a successful handoff.
+
+The total runtime limit covers all attempts and retry delays; stopping also works
+during backoff. Missing or damaged temporary MCP configs and DSH bridge files are
+regenerated before the next tool-chain launch.
+
+Clarification answers and approval decisions remain available to retry if the
+engine fails to accept the continuation. Confirmed application requests survive
+transient CLI retries. Failed session or spec writes preserve the last committed
+state; concurrent directory changes cannot leak into another command.
+
+Malformed CLI JSON is ignored. Parser or event-handler failures end the affected
+turn, and cancellation waits for the CLI process tree to stop before releasing
+the session.
 
 **Proactive mode** — work that starts without you
 
@@ -223,6 +252,12 @@ dsh --profile headless --help
 Configure models and credentials in DSH's user directory (`~/.dsh/.env` by default, or `$DSH_HOME/.env`) following the [official headless documentation](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.1-rc.5/packages/bundle/headless/README.md). Keep them out of this repository's `.env` and bot JSON. Send `/dsh <task>` in a new thread, or set `defaultCli` to `"dsh"`.
 
 Supports task execution, automatic continuation in the same thread, tool progress, usage totals, and all five MCP application tools. Agent OS writes a temporary MCP patch and native event bridge without changing DSH's user configuration or adding a model API dependency. All five tools must register before the headless task starts; MCP or bridge startup failures block execution. Application-tool results from child agents and PTC programs reach the same thread; human answers resume the main session. One CLI execution accepts one successful application request; additional concurrent requests receive an explicit error and can be submitted after the current request is handled. DSH runs with `workspace-write` and denies operations requiring interactive escalation; approval in Lark does not bypass that sandbox.
+
+Usage includes the main task, descendant agents and sampled failed attempts,
+including CLI retries. Missing counters stay unknown rather than publishing a
+partial sum as an exact total. Truncated progress arguments from ordinary tools
+do not make a successful execution fail; application requests still use the
+lossless bridge.
 
 The headless interface currently exposes neither a session list nor native command routing, so the `/resume` picker and manual `/compact` are unavailable. Existing threads continue automatically; DSH owns automatic compaction, and `/new` starts fresh context. Application requests use lossless native final tool results instead of truncated JSONL notifications. Native session bindings survive first-turn failures and cancellation. Verification markers use the actual created child preset identity (`tester` / `code-reviewer`), never free-form descriptions. After configuring DSH, run `pnpm probe:tool dsh /absolute/workspace` in a trusted test workspace to verify MCP end to end.
 

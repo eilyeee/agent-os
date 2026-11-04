@@ -7,6 +7,9 @@ import type {
   CliRunStats,
 } from "./types.js";
 import { APP_TOOL_NAMES, codexAppToolArgs } from "./app-tools.js";
+import { z } from "zod";
+
+const EventEnvelopeSchema = z.object({ type: z.string() }).passthrough();
 
 interface CodexEvent {
   type?: unknown;
@@ -166,7 +169,9 @@ export class CodexAdapter implements CliAdapter {
   parseEvents(line: string): CliEvent[] {
     let event: CodexEvent;
     try {
-      event = JSON.parse(line) as CodexEvent;
+      const parsed = EventEnvelopeSchema.safeParse(JSON.parse(line));
+      if (!parsed.success) return [];
+      event = parsed.data;
     } catch {
       // Codex 网络重连时会打非 JSON 日志，跳过即可。
       return [];
@@ -176,7 +181,9 @@ export class CodexAdapter implements CliAdapter {
       return [{ type: "session", sessionId: event.thread_id }];
     }
     if (event.type === "error" || event.type === "turn.failed") {
-      return [{ type: "error", message: errorMessage(event) }];
+      const stats = parseStats(event.usage);
+      // 失败时若原生协议给了 usage 也要保留；没有采样则不能从上下文推算消耗。
+      return [...(stats ? [{ type: "result" as const, answer: "", stats }] : []), { type: "error", message: errorMessage(event) }];
     }
     if (event.type === "turn.completed") {
       const stats = parseStats(event.usage);
